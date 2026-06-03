@@ -1,0 +1,15 @@
+[package]
+name = "rustprobe-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+libc.workspace = true
+rustprobe-attrib = { path = "../rustprobe-attrib" }
+rustprobe-core = { path = "../rustprobe-core" }
+rustprobe-flow = { path = "../rustprobe-flow" }
+rustprobe-parse = { path = "../rustprobe-parse" }
+rustprobe-store = { path = "../rustprobe-store" }

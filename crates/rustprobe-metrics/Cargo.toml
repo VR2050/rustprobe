@@ -1,0 +1,9 @@
+[package]
+name = "rustprobe-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rayon.workspace = true
+rustprobe-core = { path = "../rustprobe-core" }

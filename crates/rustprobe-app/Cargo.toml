@@ -1,0 +1,19 @@
+[package]
+name = "rustprobe-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+rustprobe-attrib = { path = "../rustprobe-attrib" }
+rustprobe-capture = { path = "../rustprobe-capture" }
+rustprobe-core = { path = "../rustprobe-core" }
+rustprobe-detect = { path = "../rustprobe-detect" }
+rustprobe-flow = { path = "../rustprobe-flow" }
+rustprobe-ipc = { path = "../rustprobe-ipc" }
+rustprobe-metrics = { path = "../rustprobe-metrics" }
+rustprobe-parse = { path = "../rustprobe-parse" }
+rustprobe-store = { path = "../rustprobe-store" }

@@ -1,0 +1,177 @@
+use anyhow::Result;
+use rustprobe_core::{AppEvent, AppIdentity, AppSelectionMode, FlowKey, FlowOwnerQuery, FlowState};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock};
+
+static ATTRIBUTION_RUNTIME: OnceLock<Mutex<AttributionActor>> = OnceLock::new();
+
+#[derive(Debug)]
+pub struct AttributionActor {
+    selection_mode: AppSelectionMode,
+    package_catalog: HashMap<String, AppIdentity>,
+    uid_catalog: HashMap<u32, AppIdentity>,
+    flow_owner_cache: HashMap<FlowKey, u32>,
+    pending_owner_queries: VecDeque<FlowOwnerQuery>,
+    pending_owner_keys: HashSet<FlowKey>,
+}
+
+impl Default for AttributionActor {
+    fn default() -> Self {
+        Self {
+            selection_mode: AppSelectionMode::Global,
+            package_catalog: HashMap::new(),
+            uid_catalog: HashMap::new(),
+            flow_owner_cache: HashMap::new(),
+            pending_owner_queries: VecDeque::new(),
+            pending_owner_keys: HashSet::new(),
+        }
+    }
+}
+
+impl AttributionActor {
+    pub fn register_apps(&mut self, apps: impl IntoIterator<Item = AppIdentity>) {
+        self.package_catalog.clear();
+        self.uid_catalog.clear();
+
+        for app in apps {
+            self.package_catalog
+                .insert(app.package_name.clone(), app.clone());
+            self.uid_catalog.insert(app.uid, app);
+        }
+    }
+
+    pub fn set_selection_mode(&mut self, selection_mode: AppSelectionMode) {
+        self.selection_mode = selection_mode;
+    }
+
+    pub fn attribute_flow(
+        &self,
+        flow: &FlowState,
+        owning_uid: Option<u32>,
+    ) -> Option<AppIdentity> {
+        let cached_uid = self.flow_owner_cache.get(&flow.key).copied();
+        let app = cached_uid
+            .or(owning_uid)
+            .and_then(|uid| self.uid_catalog.get(&uid).cloned())
+            .or_else(|| self.fallback_selected_app());
+
+        if self.selection_mode.matches(app.as_ref()) {
+            app
+        } else {
+            None
+        }
+    }
+
+    pub fn should_track(&self, app: Option<&AppIdentity>) -> bool {
+        self.selection_mode.matches(app)
+    }
+
+    pub fn register_flow_owner(&mut self, key: FlowKey, uid: u32) {
+        self.pending_owner_keys.remove(&key);
+        self.flow_owner_cache.insert(key, uid);
+    }
+
+    pub fn queue_owner_query(&mut self, key: FlowKey) {
+        if self.flow_owner_cache.contains_key(&key) || self.pending_owner_keys.contains(&key) {
+            return;
+        }
+
+        self.pending_owner_keys.insert(key.clone());
+        self.pending_owner_queries.push_back(FlowOwnerQuery { key });
+    }
+
+    pub fn take_pending_owner_queries(&mut self, limit: usize) -> Vec<FlowOwnerQuery> {
+        let mut output = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            match self.pending_owner_queries.pop_front() {
+                Some(query) => output.push(query),
+                None => break,
+            }
+        }
+        output
+    }
+
+    pub fn attribute(&self, flow: &FlowState) -> AppEvent {
+        let app = flow.app.clone().unwrap_or(AppIdentity {
+            uid: 10_001,
+            package_name: "com.example.target".into(),
+            app_label: "Example Target".into(),
+        });
+
+        AppEvent {
+            app,
+            flow_id: format!(
+                "{}:{}-{}:{}-{:?}",
+                flow.key.src_addr,
+                flow.key.src_port,
+                flow.key.dst_addr,
+                flow.key.dst_port,
+                flow.key.protocol
+            ),
+        }
+    }
+
+    fn fallback_selected_app(&self) -> Option<AppIdentity> {
+        match &self.selection_mode {
+            AppSelectionMode::Single(package_name) => self.package_catalog.get(package_name).cloned(),
+            _ => None,
+        }
+    }
+}
+
+fn runtime() -> &'static Mutex<AttributionActor> {
+    ATTRIBUTION_RUNTIME.get_or_init(|| Mutex::new(AttributionActor::default()))
+}
+
+pub fn sync_installed_apps(apps: Vec<AppIdentity>) -> Result<()> {
+    let mut actor = runtime()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("attribution runtime poisoned"))?;
+    actor.register_apps(apps);
+    Ok(())
+}
+
+pub fn set_monitoring_selection(selection_mode: AppSelectionMode) -> Result<()> {
+    let mut actor = runtime()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("attribution runtime poisoned"))?;
+    actor.set_selection_mode(selection_mode);
+    Ok(())
+}
+
+pub fn attribute_flow_runtime(flow: &FlowState, owning_uid: Option<u32>) -> Option<AppIdentity> {
+    runtime()
+        .lock()
+        .ok()
+        .and_then(|actor| actor.attribute_flow(flow, owning_uid))
+}
+
+pub fn register_flow_owner_runtime(key: FlowKey, uid: u32) -> Result<()> {
+    let mut actor = runtime()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("attribution runtime poisoned"))?;
+    actor.register_flow_owner(key, uid);
+    Ok(())
+}
+
+pub fn queue_owner_query_runtime(key: FlowKey) -> Result<()> {
+    let mut actor = runtime()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("attribution runtime poisoned"))?;
+    actor.queue_owner_query(key);
+    Ok(())
+}
+
+pub fn take_pending_owner_queries_runtime(limit: usize) -> Result<Vec<FlowOwnerQuery>> {
+    let mut actor = runtime()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("attribution runtime poisoned"))?;
+    Ok(actor.take_pending_owner_queries(limit))
+}
+
+pub fn selection_summary() -> String {
+    runtime()
+        .lock()
+        .map(|actor| format!("{:?}", actor.selection_mode))
+        .unwrap_or_else(|_| "Unavailable".into())
+}

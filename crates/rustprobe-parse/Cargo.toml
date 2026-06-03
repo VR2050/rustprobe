@@ -1,0 +1,10 @@
+[package]
+name = "rustprobe-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pnet.workspace = true
+rustprobe-core = { path = "../rustprobe-core" }

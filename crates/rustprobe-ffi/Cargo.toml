@@ -1,0 +1,15 @@
+[package]
+name = "rustprobe-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni.workspace = true
+serde_json.workspace = true
+rustprobe-attrib = { path = "../rustprobe-attrib" }
+rustprobe-capture = { path = "../rustprobe-capture" }
+rustprobe-core = { path = "../rustprobe-core" }

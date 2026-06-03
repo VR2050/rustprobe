@@ -1,0 +1,11 @@
+/target/
+/.idea/
+/.vscode/
+/.gradle/
+/android/.gradle/
+/android/app/build/
+/ui/node_modules/
+/ui/dist/
+*.iml
+*.log
+local.properties
