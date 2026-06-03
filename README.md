@@ -1,5 +1,33 @@
 # RustProbe 设计大纲
 
+## 当前实现状态
+
+截至 `2026-06-03`，项目已经从纯设计阶段进入“主链路可验证运行”阶段。
+
+当前已经完成并在真机上验证过的能力：
+
+- Android `VPNService` 可正常拉起并建立 TUN
+- Kotlin -> JNI -> Rust 的 fd 传递链路已打通
+- Rust 后台线程可持续读取 TUN 流量
+- 已支持 `IPv4 / IPv6 / TCP / UDP / ICMP / ICMPv6` 基础解析
+- 已支持五元组 flow 聚合
+- 已支持 `IP / Port` 对象级聚合
+- 已支持 JSONL 落盘到 Android App 私有目录
+- 已验证在真机上可捕获真实业务流量，而不仅是占位包
+
+当前已知边界与未完成项：
+
+- 逐 flow 的应用归因仍未稳定命中，日志中仍会出现 `app=unattributed`
+- 应用层协议解析还处于起步阶段，`DNS / TLS SNI / HTTP` 解析尚未正式接入主链路
+- 当前日志较偏调试风格，还没有整理为更适合长期运行的状态输出
+- UI 仍是占位骨架，当前阶段以主链路和分析内核为主
+
+相关实现文档：
+
+- 架构说明：[docs/architecture.md](docs/architecture.md)
+- Android 打包说明：[docs/android-apk-build.md](docs/android-apk-build.md)
+- 下一阶段计划：[docs/next-step-plan.md](docs/next-step-plan.md)
+
 ## 1. 项目目标
 
 RustProbe 是一个面向 **非 Root Android 设备** 的安全流量分析探针 App，目标是在 **不依赖 Root** 的前提下，尽最大限度捕获设备网络流量，并基于 Rust 完成高性能解析、关联、检测与展示。
