@@ -37,6 +37,7 @@ import kotlin.concurrent.thread
 class MainActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var autoRefreshEnabled = false
+    private var manuallyStopped = false
     private val refreshTicker = object : Runnable {
         override fun run() {
             refreshDashboard()
@@ -303,6 +304,7 @@ class MainActivity : ComponentActivity() {
                         requestVpnAndStart()
                     })
                     addView(actionButton("停止监听") {
+                        manuallyStopped = true
                         stopService(Intent(this@MainActivity, RustProbeVpnService::class.java))
                         stopAutoRefresh()
                         statusTextView?.text = "已请求停止 VPN 监听服务。"
@@ -608,6 +610,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startVpnService() {
+        manuallyStopped = false
         startService(Intent(this, RustProbeVpnService::class.java))
         statusTextView?.text = "已请求启动 VPN 监听服务。"
         updateStatusChip("监听启动中", false)
@@ -634,6 +637,9 @@ class MainActivity : ComponentActivity() {
         val selectionSummary = runCatching { RustBridge.nativeSelectionSummary() }.getOrDefault("unavailable")
         val attribution = runCatching { RustBridge.attributionStats() }.getOrNull()
         val outputDir = File(filesDir, "rustprobe-output")
+        val flowCoverage = computeFlowCoverageStats(
+            readLastJsonObjects(File(outputDir, "flows.jsonl"), limit = 240),
+        )
 
         summaryTextView?.text = buildString {
             appendLine("模式: ${if (MonitoringPreferences.forwardingEnabled) "Forward" else "Capture"}")
@@ -666,6 +672,24 @@ class MainActivity : ComponentActivity() {
                 appendLine("owner 解析成功数: ${attribution.totalOwnerResolutions}")
             } else {
                 appendLine("归因统计: 暂不可用")
+            }
+            appendLine()
+            appendLine("最近 flow 命中统计:")
+            appendLine("唯一 flow 数: ${flowCoverage.uniqueFlows}")
+            appendLine(
+                "带域名 flow: ${flowCoverage.domainFlows}" +
+                    formatRate(flowCoverage.domainFlows, flowCoverage.uniqueFlows),
+            )
+            appendLine(
+                "已归因 flow: ${flowCoverage.attributedFlows}" +
+                    formatRate(flowCoverage.attributedFlows, flowCoverage.uniqueFlows),
+            )
+            appendLine("协议分布: ${flowCoverage.protocolSummary()}")
+            appendLine("域名来源: ${flowCoverage.domainSourceSummary()}")
+            appendLine("候选命中: DNS=${flowCoverage.dnsCandidates} TLS=${flowCoverage.tlsCandidates} QUIC=${flowCoverage.quicCandidates} QUIC-Initial=${flowCoverage.quicInitialCandidates}")
+            appendLine("高级识别: DoH=${flowCoverage.dohCandidates} DoT=${flowCoverage.dotCandidates} HTTP/3=${flowCoverage.http3Candidates}")
+            if (flowCoverage.alpnSummary().isNotBlank()) {
+                appendLine("ALPN Top: ${flowCoverage.alpnSummary()}")
             }
         }
         updateStatusChip(
@@ -858,7 +882,10 @@ class MainActivity : ComponentActivity() {
     private fun formatFlowEvent(event: JSONObject): String {
         val key = event.optJSONObject("key")
         val app = event.optJSONObject("app")
-        val protocol = key?.optString("protocol", "-") ?: "-"
+        val protocol = event.optString("protocol_hint")
+            .takeIf { it.isNotBlank() }
+            ?: key?.optString("protocol", "-")
+            ?: "-"
         val srcAddr = key?.optString("src_addr", "-") ?: "-"
         val srcPort = key?.optInt("src_port", 0) ?: 0
         val dstAddr = key?.optString("dst_addr", "-") ?: "-"
@@ -866,7 +893,27 @@ class MainActivity : ComponentActivity() {
         val packets = event.optLong("packets", 0)
         val bytes = event.optLong("payload_bytes", 0)
         val domain = event.optString("domain", "")
+        val domainSource = event.optString("domain_source", "")
         val sni = event.optString("tls_server_name", "")
+        val quicSni = event.optString("quic_server_name", "")
+        val httpHost = event.optString("http_host", "")
+        val dohCandidate = event.optBoolean("doh_candidate", false)
+        val dotCandidate = event.optBoolean("dot_candidate", false)
+        val http3Candidate = event.optBoolean("http3_candidate", false)
+        val dnsCandidate = event.optBoolean("dns_candidate", false)
+        val tlsCandidate = event.optBoolean("tls_candidate", false)
+        val quicCandidate = event.optBoolean("quic_candidate", false)
+        val quicInitialCandidate = event.optBoolean("quic_initial_candidate", false)
+        val alpn = event.optJSONArray("application_protocols")
+            ?.let { array ->
+                buildList {
+                    for (index in 0 until array.length()) {
+                        val value = array.optString(index)
+                        if (value.isNotBlank()) add(value)
+                    }
+                }
+            }
+            .orEmpty()
         val appName = app?.optString("package_name", "unattributed") ?: "unattributed"
 
         return buildString {
@@ -874,8 +921,104 @@ class MainActivity : ComponentActivity() {
             append(" packets=$packets bytes=$bytes")
             append(" app=$appName")
             if (domain.isNotBlank()) append(" domain=$domain")
+            if (domainSource.isNotBlank()) append(" source=$domainSource")
             if (sni.isNotBlank()) append(" sni=$sni")
+            if (quicSni.isNotBlank()) append(" quic-sni=$quicSni")
+            if (httpHost.isNotBlank()) append(" host=$httpHost")
+            if (alpn.isNotEmpty()) append(" alpn=${alpn.joinToString(",")}")
+            if (dnsCandidate) append(" dns?")
+            if (tlsCandidate) append(" tls?")
+            if (quicCandidate) append(" quic?")
+            if (quicInitialCandidate) append(" quic-initial?")
+            if (dohCandidate) append(" doh?")
+            if (dotCandidate) append(" dot?")
+            if (http3Candidate) append(" h3?")
         }
+    }
+
+    private fun computeFlowCoverageStats(events: List<JSONObject>): FlowCoverageStats {
+        if (events.isEmpty()) return FlowCoverageStats.EMPTY
+
+        val latestByFlow = linkedMapOf<String, JSONObject>()
+        events.forEach { event ->
+            val key = event.optJSONObject("key") ?: return@forEach
+            val flowId = listOf(
+                key.optString("src_addr"),
+                key.optInt("src_port"),
+                key.optString("dst_addr"),
+                key.optInt("dst_port"),
+                key.optString("protocol"),
+            ).joinToString("|")
+            val lastSeen = event.optLong("last_seen_unix_ms", 0)
+            val existing = latestByFlow[flowId]
+            if (existing == null || lastSeen >= existing.optLong("last_seen_unix_ms", 0)) {
+                latestByFlow[flowId] = event
+            }
+        }
+
+        val protocolCounts = linkedMapOf<String, Int>()
+        val domainSourceCounts = linkedMapOf<String, Int>()
+        val alpnCounts = linkedMapOf<String, Int>()
+        var attributedFlows = 0
+        var domainFlows = 0
+        var dnsCandidates = 0
+        var tlsCandidates = 0
+        var quicCandidates = 0
+        var quicInitialCandidates = 0
+        var dohCandidates = 0
+        var dotCandidates = 0
+        var http3Candidates = 0
+
+        latestByFlow.values.forEach { event ->
+            val protocol = event.optString("protocol_hint").ifBlank {
+                event.optJSONObject("key")?.optString("protocol", "Unknown") ?: "Unknown"
+            }
+            protocolCounts[protocol] = (protocolCounts[protocol] ?: 0) + 1
+            if (event.optJSONObject("app") != null) attributedFlows += 1
+            if (event.optString("domain").isNotBlank()) domainFlows += 1
+            val domainSource = event.optString("domain_source")
+            if (domainSource.isNotBlank()) {
+                domainSourceCounts[domainSource] = (domainSourceCounts[domainSource] ?: 0) + 1
+            }
+            if (event.optBoolean("dns_candidate", false)) dnsCandidates += 1
+            if (event.optBoolean("tls_candidate", false)) tlsCandidates += 1
+            if (event.optBoolean("quic_candidate", false)) quicCandidates += 1
+            if (event.optBoolean("quic_initial_candidate", false)) quicInitialCandidates += 1
+            if (event.optBoolean("doh_candidate", false)) dohCandidates += 1
+            if (event.optBoolean("dot_candidate", false)) dotCandidates += 1
+            if (event.optBoolean("http3_candidate", false)) http3Candidates += 1
+            val protocols = event.optJSONArray("application_protocols")
+            if (protocols != null) {
+                for (index in 0 until protocols.length()) {
+                    val value = protocols.optString(index)
+                    if (value.isNotBlank()) {
+                        alpnCounts[value] = (alpnCounts[value] ?: 0) + 1
+                    }
+                }
+            }
+        }
+
+        return FlowCoverageStats(
+            uniqueFlows = latestByFlow.size,
+            attributedFlows = attributedFlows,
+            domainFlows = domainFlows,
+            dnsCandidates = dnsCandidates,
+            tlsCandidates = tlsCandidates,
+            quicCandidates = quicCandidates,
+            quicInitialCandidates = quicInitialCandidates,
+            dohCandidates = dohCandidates,
+            dotCandidates = dotCandidates,
+            http3Candidates = http3Candidates,
+            protocolCounts = protocolCounts,
+            domainSourceCounts = domainSourceCounts,
+            alpnCounts = alpnCounts,
+        )
+    }
+
+    private fun formatRate(part: Int, total: Int): String {
+        if (total <= 0) return ""
+        val ratio = (part * 100.0) / total.toDouble()
+        return " (${String.format("%.1f", ratio)}%)"
     }
 
     private fun aggregateObjectEvents(events: List<JSONObject>): AggregatedObjects {
@@ -988,6 +1131,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun evaluateAutoRefresh() {
+        if (manuallyStopped) {
+            stopAutoRefresh()
+            return
+        }
         if (isListeningActive()) {
             startAutoRefresh()
         } else {
@@ -1070,6 +1217,60 @@ class MainActivity : ComponentActivity() {
         val bytes: Long,
         val lastSeenUnixMs: Long,
     )
+
+    private data class FlowCoverageStats(
+        val uniqueFlows: Int,
+        val attributedFlows: Int,
+        val domainFlows: Int,
+        val dnsCandidates: Int,
+        val tlsCandidates: Int,
+        val quicCandidates: Int,
+        val quicInitialCandidates: Int,
+        val dohCandidates: Int,
+        val dotCandidates: Int,
+        val http3Candidates: Int,
+        val protocolCounts: Map<String, Int>,
+        val domainSourceCounts: Map<String, Int>,
+        val alpnCounts: Map<String, Int>,
+    ) {
+        fun protocolSummary(): String {
+            return summarize(protocolCounts)
+        }
+
+        fun domainSourceSummary(): String {
+            return summarize(domainSourceCounts)
+        }
+
+        fun alpnSummary(): String {
+            return summarize(alpnCounts, limit = 4)
+        }
+
+        private fun summarize(values: Map<String, Int>, limit: Int = 6): String {
+            if (values.isEmpty()) return "暂无"
+            return values.entries
+                .sortedByDescending { it.value }
+                .take(limit)
+                .joinToString(" | ") { "${it.key}=${it.value}" }
+        }
+
+        companion object {
+            val EMPTY = FlowCoverageStats(
+                uniqueFlows = 0,
+                attributedFlows = 0,
+                domainFlows = 0,
+                dnsCandidates = 0,
+                tlsCandidates = 0,
+                quicCandidates = 0,
+                quicInitialCandidates = 0,
+                dohCandidates = 0,
+                dotCandidates = 0,
+                http3Candidates = 0,
+                protocolCounts = emptyMap(),
+                domainSourceCounts = emptyMap(),
+                alpnCounts = emptyMap(),
+            )
+        }
+    }
 
     private enum class UiSelectionMode {
         Global,

@@ -7,4 +7,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 pnet.workspace = true
+aes.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
 rustprobe-core = { path = "../rustprobe-core" }

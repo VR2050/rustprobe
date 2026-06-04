@@ -188,8 +188,9 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                         attributed_flow_packets += 1;
                                         if flow.flow.packets == 1 {
                                             log_info(format!(
-                                                "flow attributed protocol={:?} {}:{} -> {}:{} app={} uid={}",
+                                                "flow attributed transport={:?} protocol_hint={:?} {}:{} -> {}:{} app={} uid={}",
                                                 flow.flow.key.protocol,
+                                                flow.flow.protocol_hint,
                                                 flow.flow.key.src_addr,
                                                 flow.flow.key.src_port,
                                                 flow.flow.key.dst_addr,
@@ -206,8 +207,9 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                                 if enqueued {
                                                     owner_query_enqueued += 1;
                                                     log_info(format!(
-                                                        "queued owner query protocol={:?} {}:{} -> {}:{}",
+                                                        "queued owner query transport={:?} protocol_hint={:?} {}:{} -> {}:{}",
                                                         flow.flow.key.protocol,
+                                                        flow.flow.protocol_hint,
                                                         flow.flow.key.src_addr,
                                                         flow.flow.key.src_port,
                                                         flow.flow.key.dst_addr,
@@ -248,9 +250,18 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     log_info(format!(
-                                        "packet #{count} size={size} ip={:?} protocol={:?} {}:{} -> {}:{} payload={} domain={} sni={} app={} active_flows={} expired_flows={} flow_packets={} flow_bytes={} top_objects=[{}]",
+                                        "packet #{count} size={size} ip={:?} transport={:?} protocol={:?} dns_candidate={} tls_candidate={} quic_candidate={} quic_initial_candidate={} doh_candidate={} dot_candidate={} http3_candidate={} domain_source={:?} {}:{} -> {}:{} payload={} domain={} sni={} quic_sni={} http_host={} alpn={} app={} active_flows={} expired_flows={} flow_packets={} flow_bytes={} top_objects=[{}]",
                                         parsed.ip_version,
+                                        parsed.transport_protocol,
                                         parsed.protocol,
+                                        parsed.dns_candidate,
+                                        parsed.tls_candidate,
+                                        parsed.quic_candidate,
+                                        parsed.quic_initial_candidate,
+                                        parsed.doh_candidate,
+                                        parsed.dot_candidate,
+                                        parsed.http3_candidate,
+                                        flow.flow.domain_source,
                                         parsed.src_addr,
                                         parsed.src_port.unwrap_or(0),
                                         parsed.dst_addr,
@@ -268,6 +279,21 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                             .unwrap_or("-"),
                                         flow
                                             .flow
+                                            .quic_server_name
+                                            .as_deref()
+                                            .unwrap_or("-"),
+                                        flow
+                                            .flow
+                                            .http_host
+                                            .as_deref()
+                                            .unwrap_or("-"),
+                                        if flow.flow.application_protocols.is_empty() {
+                                            "-".to_string()
+                                        } else {
+                                            flow.flow.application_protocols.join(",")
+                                        },
+                                        flow
+                                            .flow
                                             .app
                                             .as_ref()
                                             .map(|app| app.package_name.as_str())
@@ -281,14 +307,29 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                 } else {
                                     non_flow_packets += 1;
                                     log_info(format!(
-                                        "packet #{count} size={size} ip={:?} protocol={:?} {} -> {} payload={} domain={} sni={} (non-flow transport)",
+                                        "packet #{count} size={size} ip={:?} transport={:?} protocol={:?} dns_candidate={} tls_candidate={} quic_candidate={} quic_initial_candidate={} doh_candidate={} dot_candidate={} http3_candidate={} {} -> {} payload={} domain={} sni={} quic_sni={} http_host={} alpn={} (non-flow transport)",
                                         parsed.ip_version,
+                                        parsed.transport_protocol,
                                         parsed.protocol,
+                                        parsed.dns_candidate,
+                                        parsed.tls_candidate,
+                                        parsed.quic_candidate,
+                                        parsed.quic_initial_candidate,
+                                        parsed.doh_candidate,
+                                        parsed.dot_candidate,
+                                        parsed.http3_candidate,
                                         parsed.src_addr,
                                         parsed.dst_addr,
                                         parsed.payload_len,
                                         parsed.dns_query_name.as_deref().unwrap_or("-"),
                                         parsed.tls_server_name.as_deref().unwrap_or("-"),
+                                        parsed.quic_server_name.as_deref().unwrap_or("-"),
+                                        parsed.http_host.as_deref().unwrap_or("-"),
+                                        if parsed.application_protocols.is_empty() {
+                                            "-".to_string()
+                                        } else {
+                                            parsed.application_protocols.join(",")
+                                        },
                                     ));
                                 }
                             }
