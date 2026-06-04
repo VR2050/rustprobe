@@ -19,27 +19,27 @@ object RustBridge {
     external fun nativeIsCaptureRunning(): Boolean
     external fun nativePacketsSeen(): Int
     external fun nativeSyncInstalledApps(appsJson: String): Boolean
+    external fun nativeUpsertApp(appJson: String): Boolean
     external fun nativeSetMonitoringSelection(selectionJson: String): Boolean
     external fun nativeSetOutputDirectory(path: String): Boolean
     external fun nativeRegisterOwnerResolution(resolutionJson: String): Boolean
     external fun nativeTakePendingOwnerQueries(limit: Int): String
     external fun nativeQueueOwnerQuery(queryJson: String): Boolean
     external fun nativeSelectionSummary(): String
+    external fun nativeAttributionStats(): String
 
     fun syncInstalledApps(apps: List<InstalledAppInfo>): Boolean {
         val json = JSONArray().apply {
             apps.forEach { app ->
-                put(
-                    JSONObject().apply {
-                        put("uid", app.uid)
-                        put("package_name", app.packageName)
-                        put("app_label", app.appLabel)
-                    },
-                )
+                put(app.toRustJson())
             }
         }.toString()
 
         return nativeSyncInstalledApps(json)
+    }
+
+    fun upsertApp(app: InstalledAppInfo): Boolean {
+        return nativeUpsertApp(app.toRustJson().toString())
     }
 
     fun setMonitoringSelection(selection: MonitoringSelection): Boolean {
@@ -99,5 +99,18 @@ object RustBridge {
                 )
             }
         }
+    }
+
+    fun attributionStats(): AttributionStats {
+        val json = JSONObject(nativeAttributionStats())
+        return AttributionStats(
+            trackedApps = json.optInt("tracked_apps"),
+            cachedFlowOwners = json.optInt("cached_flow_owners"),
+            pendingOwnerQueries = json.optInt("pending_owner_queries"),
+            totalOwnerQueriesEnqueued = json.optLong("total_owner_queries_enqueued"),
+            totalOwnerQueriesDrained = json.optLong("total_owner_queries_drained"),
+            totalOwnerQueriesSkipped = json.optLong("total_owner_queries_skipped"),
+            totalOwnerResolutions = json.optLong("total_owner_resolutions"),
+        )
     }
 }

@@ -68,6 +68,9 @@ pub struct ParsedPacket {
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
     pub payload_len: usize,
+    pub dns_query_name: Option<String>,
+    pub tls_server_name: Option<String>,
+    pub transport_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -94,6 +97,8 @@ pub struct FlowOwnerResolution {
 pub struct FlowState {
     pub key: FlowKey,
     pub app: Option<AppIdentity>,
+    pub domain: Option<String>,
+    pub tls_server_name: Option<String>,
     pub packets: u64,
     pub payload_bytes: u64,
     pub first_seen_unix_ms: u128,
@@ -106,6 +111,8 @@ impl FlowState {
         Self {
             key,
             app: None,
+            domain: None,
+            tls_server_name: None,
             packets: 1,
             payload_bytes: payload_len as u64,
             first_seen_unix_ms: now,
@@ -121,6 +128,14 @@ impl FlowState {
 
     pub fn set_app(&mut self, app: Option<AppIdentity>) {
         self.app = app;
+    }
+
+    pub fn set_domain(&mut self, domain: Option<String>) {
+        self.domain = domain;
+    }
+
+    pub fn set_tls_server_name(&mut self, server_name: Option<String>) {
+        self.tls_server_name = server_name;
     }
 }
 

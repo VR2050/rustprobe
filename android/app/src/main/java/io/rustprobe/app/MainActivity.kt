@@ -48,6 +48,7 @@ class MainActivity : ComponentActivity() {
                 append("RustProbe Android shell placeholder\n")
                 append("Installed apps discovered: ${installedApps.size}\n")
                 append("Current monitoring mode: ${MonitoringPreferences.selection}\n")
+                append("Forwarding mode: ${MonitoringPreferences.forwardingEnabled}\n")
                 append("Rust app sync: $syncedApps, selection sync: $syncedSelection\n")
                 append("Rust selection summary: ${RustBridge.nativeSelectionSummary()}\n")
                 append("Request VPN permission to continue.")

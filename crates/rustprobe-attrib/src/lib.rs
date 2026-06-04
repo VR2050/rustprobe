@@ -1,9 +1,21 @@
 use anyhow::Result;
 use rustprobe_core::{AppEvent, AppIdentity, AppSelectionMode, FlowKey, FlowOwnerQuery, FlowState};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 static ATTRIBUTION_RUNTIME: OnceLock<Mutex<AttributionActor>> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AttributionStats {
+    pub tracked_apps: usize,
+    pub cached_flow_owners: usize,
+    pub pending_owner_queries: usize,
+    pub total_owner_queries_enqueued: u64,
+    pub total_owner_queries_drained: u64,
+    pub total_owner_queries_skipped: u64,
+    pub total_owner_resolutions: u64,
+}
 
 #[derive(Debug)]
 pub struct AttributionActor {
@@ -13,6 +25,10 @@ pub struct AttributionActor {
     flow_owner_cache: HashMap<FlowKey, u32>,
     pending_owner_queries: VecDeque<FlowOwnerQuery>,
     pending_owner_keys: HashSet<FlowKey>,
+    total_owner_queries_enqueued: u64,
+    total_owner_queries_drained: u64,
+    total_owner_queries_skipped: u64,
+    total_owner_resolutions: u64,
 }
 
 impl Default for AttributionActor {
@@ -24,19 +40,27 @@ impl Default for AttributionActor {
             flow_owner_cache: HashMap::new(),
             pending_owner_queries: VecDeque::new(),
             pending_owner_keys: HashSet::new(),
+            total_owner_queries_enqueued: 0,
+            total_owner_queries_drained: 0,
+            total_owner_queries_skipped: 0,
+            total_owner_resolutions: 0,
         }
     }
 }
 
 impl AttributionActor {
+    pub fn upsert_app(&mut self, app: AppIdentity) {
+        self.package_catalog
+            .insert(app.package_name.clone(), app.clone());
+        self.uid_catalog.insert(app.uid, app);
+    }
+
     pub fn register_apps(&mut self, apps: impl IntoIterator<Item = AppIdentity>) {
         self.package_catalog.clear();
         self.uid_catalog.clear();
 
         for app in apps {
-            self.package_catalog
-                .insert(app.package_name.clone(), app.clone());
-            self.uid_catalog.insert(app.uid, app);
+            self.upsert_app(app);
         }
     }
 
@@ -44,11 +68,7 @@ impl AttributionActor {
         self.selection_mode = selection_mode;
     }
 
-    pub fn attribute_flow(
-        &self,
-        flow: &FlowState,
-        owning_uid: Option<u32>,
-    ) -> Option<AppIdentity> {
+    pub fn attribute_flow(&self, flow: &FlowState, owning_uid: Option<u32>) -> Option<AppIdentity> {
         let cached_uid = self.flow_owner_cache.get(&flow.key).copied();
         let app = cached_uid
             .or(owning_uid)
@@ -69,15 +89,19 @@ impl AttributionActor {
     pub fn register_flow_owner(&mut self, key: FlowKey, uid: u32) {
         self.pending_owner_keys.remove(&key);
         self.flow_owner_cache.insert(key, uid);
+        self.total_owner_resolutions += 1;
     }
 
-    pub fn queue_owner_query(&mut self, key: FlowKey) {
+    pub fn queue_owner_query(&mut self, key: FlowKey) -> bool {
         if self.flow_owner_cache.contains_key(&key) || self.pending_owner_keys.contains(&key) {
-            return;
+            self.total_owner_queries_skipped += 1;
+            return false;
         }
 
         self.pending_owner_keys.insert(key.clone());
         self.pending_owner_queries.push_back(FlowOwnerQuery { key });
+        self.total_owner_queries_enqueued += 1;
+        true
     }
 
     pub fn take_pending_owner_queries(&mut self, limit: usize) -> Vec<FlowOwnerQuery> {
@@ -88,7 +112,20 @@ impl AttributionActor {
                 None => break,
             }
         }
+        self.total_owner_queries_drained += output.len() as u64;
         output
+    }
+
+    pub fn stats(&self) -> AttributionStats {
+        AttributionStats {
+            tracked_apps: self.uid_catalog.len(),
+            cached_flow_owners: self.flow_owner_cache.len(),
+            pending_owner_queries: self.pending_owner_queries.len(),
+            total_owner_queries_enqueued: self.total_owner_queries_enqueued,
+            total_owner_queries_drained: self.total_owner_queries_drained,
+            total_owner_queries_skipped: self.total_owner_queries_skipped,
+            total_owner_resolutions: self.total_owner_resolutions,
+        }
     }
 
     pub fn attribute(&self, flow: &FlowState) -> AppEvent {
@@ -113,7 +150,9 @@ impl AttributionActor {
 
     fn fallback_selected_app(&self) -> Option<AppIdentity> {
         match &self.selection_mode {
-            AppSelectionMode::Single(package_name) => self.package_catalog.get(package_name).cloned(),
+            AppSelectionMode::Single(package_name) => {
+                self.package_catalog.get(package_name).cloned()
+            }
             _ => None,
         }
     }
@@ -128,6 +167,14 @@ pub fn sync_installed_apps(apps: Vec<AppIdentity>) -> Result<()> {
         .lock()
         .map_err(|_| anyhow::anyhow!("attribution runtime poisoned"))?;
     actor.register_apps(apps);
+    Ok(())
+}
+
+pub fn upsert_app_runtime(app: AppIdentity) -> Result<()> {
+    let mut actor = runtime()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("attribution runtime poisoned"))?;
+    actor.upsert_app(app);
     Ok(())
 }
 
@@ -154,12 +201,11 @@ pub fn register_flow_owner_runtime(key: FlowKey, uid: u32) -> Result<()> {
     Ok(())
 }
 
-pub fn queue_owner_query_runtime(key: FlowKey) -> Result<()> {
+pub fn queue_owner_query_runtime(key: FlowKey) -> Result<bool> {
     let mut actor = runtime()
         .lock()
         .map_err(|_| anyhow::anyhow!("attribution runtime poisoned"))?;
-    actor.queue_owner_query(key);
-    Ok(())
+    Ok(actor.queue_owner_query(key))
 }
 
 pub fn take_pending_owner_queries_runtime(limit: usize) -> Result<Vec<FlowOwnerQuery>> {
@@ -174,4 +220,19 @@ pub fn selection_summary() -> String {
         .lock()
         .map(|actor| format!("{:?}", actor.selection_mode))
         .unwrap_or_else(|_| "Unavailable".into())
+}
+
+pub fn attribution_stats() -> AttributionStats {
+    runtime()
+        .lock()
+        .map(|actor| actor.stats())
+        .unwrap_or(AttributionStats {
+            tracked_apps: 0,
+            cached_flow_owners: 0,
+            pending_owner_queries: 0,
+            total_owner_queries_enqueued: 0,
+            total_owner_queries_drained: 0,
+            total_owner_queries_skipped: 0,
+            total_owner_resolutions: 0,
+        })
 }

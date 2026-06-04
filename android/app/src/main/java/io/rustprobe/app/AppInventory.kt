@@ -17,4 +17,16 @@ object AppInventory {
             }
             .sortedBy { it.appLabel.lowercase() }
     }
+
+    fun findAppByUid(context: Context, uid: Int): InstalledAppInfo? {
+        val pm = context.packageManager
+        val packageName = pm.getPackagesForUid(uid)?.firstOrNull() ?: return null
+        val info = runCatching { pm.getApplicationInfo(packageName, 0) }.getOrNull() ?: return null
+        return InstalledAppInfo(
+            uid = uid,
+            packageName = packageName,
+            appLabel = pm.getApplicationLabel(info).toString(),
+            isSystemApp = info.flags and ApplicationInfo.FLAG_SYSTEM != 0,
+        )
+    }
 }

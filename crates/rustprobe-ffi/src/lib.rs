@@ -1,9 +1,10 @@
-use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+use jni::objects::{JClass, JString};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jstring};
 use rustprobe_attrib::{
-    queue_owner_query_runtime, register_flow_owner_runtime, selection_summary, set_monitoring_selection,
-    sync_installed_apps, take_pending_owner_queries_runtime,
+    attribution_stats, queue_owner_query_runtime, register_flow_owner_runtime, selection_summary,
+    set_monitoring_selection, sync_installed_apps, take_pending_owner_queries_runtime,
+    upsert_app_runtime,
 };
 use rustprobe_capture::{
     is_capture_running, packets_seen, set_output_root, start_capture_from_fd, stop_capture,
@@ -11,11 +12,7 @@ use rustprobe_capture::{
 use rustprobe_core::{AppIdentity, AppSelectionMode, FlowKey, FlowOwnerResolution};
 
 fn as_jboolean(value: bool) -> jboolean {
-    if value {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+    if value { JNI_TRUE } else { JNI_FALSE }
 }
 
 fn parse_jstring(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, String> {
@@ -55,6 +52,7 @@ pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeIsCaptureRunning(
     as_jboolean(is_capture_running())
 }
 
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativePacketsSeen(
     _env: JNIEnv<'_>,
@@ -89,6 +87,37 @@ pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeSyncInstalledApps(
         Ok(()) => JNI_TRUE,
         Err(err) => {
             println!("rustprobe-ffi: failed to sync installed apps: {err}");
+            JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeUpsertApp(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    app_json: JString<'_>,
+) -> jboolean {
+    let json = match parse_jstring(&mut env, app_json) {
+        Ok(value) => value,
+        Err(err) => {
+            println!("rustprobe-ffi: {err}");
+            return JNI_FALSE;
+        }
+    };
+
+    let app: AppIdentity = match serde_json::from_str(&json) {
+        Ok(app) => app,
+        Err(err) => {
+            println!("rustprobe-ffi: failed to parse app json: {err}");
+            return JNI_FALSE;
+        }
+    };
+
+    match upsert_app_runtime(app) {
+        Ok(()) => JNI_TRUE,
+        Err(err) => {
+            println!("rustprobe-ffi: failed to upsert app: {err}");
             JNI_FALSE
         }
     }
@@ -186,6 +215,18 @@ pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeSelectionSummary(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeAttributionStats(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let stats = attribution_stats();
+    let json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".into());
+    env.new_string(json)
+        .expect("failed to allocate attribution stats string")
+        .into_raw()
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeTakePendingOwnerQueries(
     env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -221,7 +262,7 @@ pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeQueueOwnerQuery(
     };
 
     match queue_owner_query_runtime(key) {
-        Ok(()) => JNI_TRUE,
+        Ok(_) => JNI_TRUE,
         Err(err) => {
             println!("rustprobe-ffi: failed to queue owner query: {err}");
             JNI_FALSE

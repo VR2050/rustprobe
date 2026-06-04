@@ -1,12 +1,12 @@
 use rustprobe_attrib::AttributionActor;
 use rustprobe_capture::TunCaptureActor;
+use rustprobe_core::{AppIdentity, AppSelectionMode, IpVersion, ParsedPacket};
 use rustprobe_detect::DetectionActor;
 use rustprobe_flow::FlowActor;
 use rustprobe_ipc::UiGatewayActor;
 use rustprobe_metrics::MetricsActor;
 use rustprobe_parse::ParserStage;
 use rustprobe_store::StorageActor;
-use rustprobe_core::{AppIdentity, AppSelectionMode, IpVersion, ParsedPacket};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,8 +35,13 @@ async fn main() -> anyhow::Result<()> {
         src_port: Some(flow.flow.src.port),
         dst_port: Some(flow.flow.dst.port),
         payload_len: 0,
+        dns_query_name: None,
+        tls_server_name: None,
+        transport_payload: Vec::new(),
     };
-    let ingested = flow_actor.ingest_packet(&parsed).expect("flow should be created");
+    let ingested = flow_actor
+        .ingest_packet(&parsed)
+        .expect("flow should be created");
 
     let mut flow_state = ingested.flow.clone();
     flow_state.set_app(Some(AppIdentity {

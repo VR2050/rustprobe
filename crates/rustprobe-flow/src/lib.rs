@@ -1,15 +1,18 @@
 use rustprobe_core::{
-    now_unix_ms, FlowKey, FlowState, ObjectKey, ObjectKind, ObjectState, ParsedPacket,
+    AppIdentity, FlowKey, FlowState, ObjectKey, ObjectKind, ObjectState, ParsedPacket, now_unix_ms,
 };
+use rustprobe_parse::parse_tls_client_hello_server_name;
 use std::collections::HashMap;
 
 const DEFAULT_FLOW_IDLE_TIMEOUT_MS: u128 = 60_000;
+const TLS_BUFFER_LIMIT_BYTES: usize = 4096;
 
 #[derive(Debug)]
 pub struct FlowActor {
     flows_seen: usize,
     table: HashMap<FlowKey, FlowState>,
     objects: HashMap<ObjectKey, ObjectState>,
+    tls_buffers: HashMap<FlowKey, Vec<u8>>,
     idle_timeout_ms: u128,
 }
 
@@ -27,6 +30,7 @@ impl FlowActor {
             flows_seen: 0,
             table: HashMap::new(),
             objects: HashMap::new(),
+            tls_buffers: HashMap::new(),
             idle_timeout_ms,
         }
     }
@@ -45,14 +49,36 @@ impl FlowActor {
 
         self.flows_seen += 1;
 
-        let flow = self
+        let mut flow = self
             .table
             .entry(key.clone())
-            .and_modify(|entry| entry.update(packet.payload_len))
-            .or_insert_with(|| FlowState::new(key, packet.payload_len))
+            .and_modify(|entry| {
+                entry.update(packet.payload_len);
+                merge_packet_metadata(entry, packet);
+            })
+            .or_insert_with(|| {
+                let mut flow = FlowState::new(key, packet.payload_len);
+                merge_packet_metadata(&mut flow, packet);
+                flow
+            })
             .clone();
 
-        self.update_objects(packet);
+        let derived_tls_server_name = if flow.tls_server_name.is_none() {
+            self.maybe_extract_tls_server_name(&flow.key, packet)
+        } else {
+            None
+        };
+
+        if let Some(server_name) = derived_tls_server_name.as_ref() {
+            flow.set_tls_server_name(Some(server_name.clone()));
+            flow.set_domain(Some(server_name.clone()));
+            let _ = self.table.get_mut(&flow.key).map(|entry| {
+                entry.set_tls_server_name(Some(server_name.clone()));
+                entry.set_domain(Some(server_name.clone()));
+            });
+        }
+
+        self.update_objects(packet, derived_tls_server_name.as_deref());
         let expired_flows = self.expire_idle_flows();
         let top_objects = self.top_objects(4);
 
@@ -80,15 +106,27 @@ impl FlowActor {
         self.objects.values().cloned().collect()
     }
 
+    pub fn set_flow_app(&mut self, key: &FlowKey, app: Option<AppIdentity>) -> bool {
+        match self.table.get_mut(key) {
+            Some(flow) => {
+                flow.set_app(app);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn expire_idle_flows(&mut self) -> usize {
         let now = now_unix_ms();
         let before = self.table.len();
         self.table
             .retain(|_, flow| now.saturating_sub(flow.last_seen_unix_ms) <= self.idle_timeout_ms);
+        self.tls_buffers
+            .retain(|key, _| self.table.contains_key(key));
         before.saturating_sub(self.table.len())
     }
 
-    fn update_objects(&mut self, packet: &ParsedPacket) {
+    fn update_objects(&mut self, packet: &ParsedPacket, derived_tls_server_name: Option<&str>) {
         let active_flows = self.active_flows();
         let ip_key = ObjectKey {
             kind: ObjectKind::Ip,
@@ -109,6 +147,62 @@ impl FlowActor {
                 .and_modify(|entry| entry.update(packet.payload_len, active_flows))
                 .or_insert_with(|| ObjectState::new(port_key, packet.payload_len, active_flows));
         }
+
+        if let Some(domain) = packet.dns_query_name.as_ref() {
+            self.update_domain_object(domain.clone(), packet.payload_len, active_flows);
+        }
+
+        if let Some(server_name) = packet.tls_server_name.as_ref() {
+            self.update_domain_object(server_name.clone(), packet.payload_len, active_flows);
+        }
+
+        if let Some(server_name) = derived_tls_server_name {
+            self.update_domain_object(server_name.to_string(), packet.payload_len, active_flows);
+        }
+    }
+
+    fn update_domain_object(&mut self, domain: String, bytes: usize, active_flows: usize) {
+        let domain_key = ObjectKey {
+            kind: ObjectKind::Domain,
+            value: domain,
+        };
+        self.objects
+            .entry(domain_key.clone())
+            .and_modify(|entry| entry.update(bytes, active_flows))
+            .or_insert_with(|| ObjectState::new(domain_key, bytes, active_flows));
+    }
+
+    fn maybe_extract_tls_server_name(
+        &mut self,
+        key: &FlowKey,
+        packet: &ParsedPacket,
+    ) -> Option<String> {
+        if !matches!(
+            packet.protocol,
+            rustprobe_core::ProtocolHint::Tcp | rustprobe_core::ProtocolHint::Tls
+        ) {
+            return None;
+        }
+
+        let is_tls_candidate = key.src_port == 443 || key.dst_port == 443;
+        if !is_tls_candidate || packet.transport_payload.is_empty() {
+            return None;
+        }
+
+        let buffer = self.tls_buffers.entry(key.clone()).or_default();
+        let remaining = TLS_BUFFER_LIMIT_BYTES.saturating_sub(buffer.len());
+        if remaining == 0 {
+            return parse_tls_client_hello_server_name(buffer);
+        }
+
+        let append_len = remaining.min(packet.transport_payload.len());
+        buffer.extend_from_slice(&packet.transport_payload[..append_len]);
+
+        let server_name = parse_tls_client_hello_server_name(buffer);
+        if server_name.is_some() {
+            self.tls_buffers.remove(key);
+        }
+        server_name
     }
 
     fn top_objects(&self, limit: usize) -> Vec<ObjectState> {
@@ -127,5 +221,15 @@ impl FlowActor {
 impl Default for FlowActor {
     fn default() -> Self {
         Self::new(DEFAULT_FLOW_IDLE_TIMEOUT_MS)
+    }
+}
+
+fn merge_packet_metadata(flow: &mut FlowState, packet: &ParsedPacket) {
+    if let Some(domain) = packet.dns_query_name.as_ref() {
+        flow.set_domain(Some(domain.clone()));
+    }
+    if let Some(server_name) = packet.tls_server_name.as_ref() {
+        flow.set_domain(Some(server_name.clone()));
+        flow.set_tls_server_name(Some(server_name.clone()));
     }
 }

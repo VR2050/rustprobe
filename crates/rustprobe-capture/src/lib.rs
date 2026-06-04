@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use rustprobe_attrib::{attribute_flow_runtime, queue_owner_query_runtime};
+use rustprobe_attrib::{attribute_flow_runtime, attribution_stats, queue_owner_query_runtime};
 use rustprobe_core::{Actor, ActorRef, PacketEvent};
 use rustprobe_flow::FlowActor;
 use rustprobe_parse::ParserStage;
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
 static PACKETS_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -19,11 +19,7 @@ const LOG_TAG: &str = "rustprobe-capture";
 
 #[cfg(target_os = "android")]
 unsafe extern "C" {
-    fn __android_log_write(
-        prio: i32,
-        tag: *const libc::c_char,
-        text: *const libc::c_char,
-    ) -> i32;
+    fn __android_log_write(prio: i32, tag: *const libc::c_char, text: *const libc::c_char) -> i32;
 }
 
 fn log_info(message: impl AsRef<str>) {
@@ -115,7 +111,7 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
             let mut store = match JsonlStore::create(&output_root) {
                 Ok(store) => {
                     log_info(format!(
-                        "JSONL persistence enabled at {}",
+                        "JSONL persistence enabled at {} (flows.jsonl, objects.jsonl)",
                         store.root().display()
                     ));
                     Some(store)
@@ -125,6 +121,46 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                     None
                 }
             };
+            let summary_interval = Duration::from_secs(5);
+            let mut last_summary_at = Instant::now();
+            let mut parse_errors = 0_u64;
+            let mut non_flow_packets = 0_u64;
+            let mut would_block_reads = 0_u64;
+            let mut attributed_flow_packets = 0_u64;
+            let mut unattributed_flow_packets = 0_u64;
+            let mut owner_query_requests = 0_u64;
+            let mut owner_query_enqueued = 0_u64;
+
+            let log_summary = |flow_actor: &FlowActor,
+                               parse_errors: u64,
+                               non_flow_packets: u64,
+                               would_block_reads: u64,
+                               attributed_flow_packets: u64,
+                               unattributed_flow_packets: u64,
+                               owner_query_requests: u64,
+                               owner_query_enqueued: u64| {
+                let attrib = attribution_stats();
+                log_info(format!(
+                    "capture summary packets_seen={} active_flows={} tracked_objects={} parse_errors={} non_flow_packets={} would_block_reads={} attributed_flow_packets={} unattributed_flow_packets={} owner_query_requests={} owner_query_enqueued={} tracked_apps={} cached_flow_owners={} pending_owner_queries={} owner_queries_enqueued_total={} owner_queries_drained={} owner_queries_skipped={} owner_resolutions={}",
+                    PACKETS_SEEN.load(Ordering::Relaxed),
+                    flow_actor.active_flows(),
+                    flow_actor.object_snapshot().len(),
+                    parse_errors,
+                    non_flow_packets,
+                    would_block_reads,
+                    attributed_flow_packets,
+                    unattributed_flow_packets,
+                    owner_query_requests,
+                    owner_query_enqueued,
+                    attrib.tracked_apps,
+                    attrib.cached_flow_owners,
+                    attrib.pending_owner_queries,
+                    attrib.total_owner_queries_enqueued,
+                    attrib.total_owner_queries_drained,
+                    attrib.total_owner_queries_skipped,
+                    attrib.total_owner_resolutions,
+                ));
+            };
 
             loop {
                 if !CAPTURE_RUNNING.load(Ordering::SeqCst) {
@@ -132,7 +168,6 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                     break;
                 }
 
-                log_info("waiting for next TUN packet");
                 match file.read(&mut buffer) {
                     Ok(0) => {
                         log_error("TUN read returned EOF");
@@ -145,13 +180,46 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                 if let Some(mut flow) = flow_actor.ingest_packet(&parsed) {
                                     let app = attribute_flow_runtime(&flow.flow, None);
                                     flow.flow.set_app(app.clone());
-                                    if app.is_none() {
-                                        if let Err(err) =
-                                            queue_owner_query_runtime(flow.flow.key.clone())
-                                        {
-                                            log_error(format!(
-                                                "failed to queue owner query: {err}"
+                                    if app.is_some() {
+                                        let _ = flow_actor
+                                            .set_flow_app(&flow.flow.key, flow.flow.app.clone());
+                                    }
+                                    if let Some(app) = app.as_ref() {
+                                        attributed_flow_packets += 1;
+                                        if flow.flow.packets == 1 {
+                                            log_info(format!(
+                                                "flow attributed protocol={:?} {}:{} -> {}:{} app={} uid={}",
+                                                flow.flow.key.protocol,
+                                                flow.flow.key.src_addr,
+                                                flow.flow.key.src_port,
+                                                flow.flow.key.dst_addr,
+                                                flow.flow.key.dst_port,
+                                                app.package_name,
+                                                app.uid,
                                             ));
+                                        }
+                                    } else {
+                                        unattributed_flow_packets += 1;
+                                        owner_query_requests += 1;
+                                        match queue_owner_query_runtime(flow.flow.key.clone()) {
+                                            Ok(enqueued) => {
+                                                if enqueued {
+                                                    owner_query_enqueued += 1;
+                                                    log_info(format!(
+                                                        "queued owner query protocol={:?} {}:{} -> {}:{}",
+                                                        flow.flow.key.protocol,
+                                                        flow.flow.key.src_addr,
+                                                        flow.flow.key.src_port,
+                                                        flow.flow.key.dst_addr,
+                                                        flow.flow.key.dst_port,
+                                                    ));
+                                                }
+                                            }
+                                            Err(err) => {
+                                                log_error(format!(
+                                                    "failed to queue owner query: {err}"
+                                                ));
+                                            }
                                         }
                                     }
                                     if let Some(store) = store.as_mut() {
@@ -181,7 +249,7 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     log_info(format!(
-                                        "packet #{count} size={size} ip={:?} protocol={:?} {}:{} -> {}:{} payload={} app={} active_flows={} expired_flows={} flow_packets={} flow_bytes={} top_objects=[{}]",
+                                        "packet #{count} size={size} ip={:?} protocol={:?} {}:{} -> {}:{} payload={} domain={} sni={} app={} active_flows={} expired_flows={} flow_packets={} flow_bytes={} top_objects=[{}]",
                                         parsed.ip_version,
                                         parsed.protocol,
                                         parsed.src_addr,
@@ -189,6 +257,16 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                         parsed.dst_addr,
                                         parsed.dst_port.unwrap_or(0),
                                         parsed.payload_len,
+                                        flow
+                                            .flow
+                                            .domain
+                                            .as_deref()
+                                            .unwrap_or("-"),
+                                        flow
+                                            .flow
+                                            .tls_server_name
+                                            .as_deref()
+                                            .unwrap_or("-"),
                                         flow
                                             .flow
                                             .app
@@ -202,17 +280,21 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                         top_objects,
                                     ));
                                 } else {
+                                    non_flow_packets += 1;
                                     log_info(format!(
-                                        "packet #{count} size={size} ip={:?} protocol={:?} {} -> {} payload={} (non-flow transport)",
+                                        "packet #{count} size={size} ip={:?} protocol={:?} {} -> {} payload={} domain={} sni={} (non-flow transport)",
                                         parsed.ip_version,
                                         parsed.protocol,
                                         parsed.src_addr,
                                         parsed.dst_addr,
                                         parsed.payload_len,
+                                        parsed.dns_query_name.as_deref().unwrap_or("-"),
+                                        parsed.tls_server_name.as_deref().unwrap_or("-"),
                                     ));
                                 }
                             }
                             Err(err) => {
+                                parse_errors += 1;
                                 log_error(format!(
                                     "packet #{count} size={size} parse error: {err}"
                                 ));
@@ -221,17 +303,40 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                     }
                     Err(err) => {
                         if err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(11) {
-                            log_info("TUN read would block; retrying");
+                            would_block_reads += 1;
                             thread::sleep(Duration::from_millis(25));
-                            continue;
+                        } else {
+                            log_error(format!("TUN read error: {err}"));
+                            break;
                         }
-
-                        log_error(format!("TUN read error: {err}"));
-                        break;
                     }
+                }
+
+                if last_summary_at.elapsed() >= summary_interval {
+                    log_summary(
+                        &flow_actor,
+                        parse_errors,
+                        non_flow_packets,
+                        would_block_reads,
+                        attributed_flow_packets,
+                        unattributed_flow_packets,
+                        owner_query_requests,
+                        owner_query_enqueued,
+                    );
+                    last_summary_at = Instant::now();
                 }
             }
 
+            log_summary(
+                &flow_actor,
+                parse_errors,
+                non_flow_packets,
+                would_block_reads,
+                attributed_flow_packets,
+                unattributed_flow_packets,
+                owner_query_requests,
+                owner_query_enqueued,
+            );
             CAPTURE_RUNNING.store(false, Ordering::SeqCst);
             log_info("background TUN reader stopped");
         })?;

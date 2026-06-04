@@ -1,0 +1,51 @@
+# Main configuration for hev-socks5-server
+
+main:
+  # Worker threads
+  workers: 4
+  # Listen port
+  port: 1080
+  # Listen address (ipv4|ipv6)
+  listen-address: '::'
+  # UDP listen port (0: random, a-b: range)
+# udp-port: 0
+  # UDP listen address (ipv4|ipv6)
+# udp-listen-address: '::1'
+  # Listen ipv6 only
+  listen-ipv6-only: false
+  # Bind source address (ipv4|ipv6)
+  # It is overridden by bind-address-v{4,6} if specified
+  bind-address: ''
+  # Bind source address (ipv4)
+  bind-address-v4: ''
+  # Bind source address (ipv6)
+  bind-address-v6: ''
+  # Bind source network interface
+  bind-interface: ''
+  # Domain address type (ipv4|ipv6|unspec)
+  domain-address-type: unspec
+  # Socket mark (hex: 0x1, dec: 1, oct: 01)
+  mark: 0
+
+#auth:
+#  file: conf/auth.txt
+#  username:
+#  password:
+
+#misc:
+   # task stack size (bytes)
+#  task-stack-size: 8192
+   # udp recv buffer size (bytes)
+#  udp-recv-buffer-size: 524288
+   # connect timeout (ms)
+#  connect-timeout: 5000
+   # read-write timeout (ms)
+#  read-write-timeout: 60000
+   # stdout, stderr or file-path
+#  log-file: stderr
+   # debug, info, warn or error
+#  log-level: warn
+   # If present, run as a daemon with this pid file
+#  pid-file: /run/hev-socks5-server.pid
+   # If present, set rlimit nofile; else use default value
+#  limit-nofile: 65535

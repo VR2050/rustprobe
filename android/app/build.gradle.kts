@@ -47,6 +47,7 @@ val buildRustJni by tasks.registering(Exec::class) {
 android {
     namespace = "io.rustprobe.app"
     compileSdk = 35
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "io.rustprobe.app"
@@ -57,6 +58,12 @@ android {
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+
+        externalNativeBuild {
+            ndkBuild {
+                arguments += listOf("APP_LDFLAGS+=-Wl,--build-id=none")
+            }
         }
     }
 
@@ -80,6 +87,12 @@ android {
     }
 
     sourceSets["main"].jniLibs.srcDir(rustJniLibsDir)
+
+    externalNativeBuild {
+        ndkBuild {
+            path = file("src/main/jni/Android.mk")
+        }
+    }
 }
 
 tasks.named("preBuild").configure {

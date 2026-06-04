@@ -364,6 +364,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rustprobe-core",
+ "serde",
  "serde_json",
 ]
 
@@ -415,6 +416,7 @@ name = "rustprobe-flow"
 version = "0.1.0"
 dependencies = [
  "rustprobe-core",
+ "rustprobe-parse",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@
 
 ## 当前实现状态
 
-截至 `2026-06-03`，项目已经从纯设计阶段进入“主链路可验证运行”阶段。
+截至 `2026-06-04`，项目已经从“只能证明技术方向可行”推进到“Android 真机上可运行、可转发、可做基础分析”的阶段。
 
 当前已经完成并在真机上验证过的能力：
 
@@ -11,22 +11,72 @@
 - Rust 后台线程可持续读取 TUN 流量
 - 已支持 `IPv4 / IPv6 / TCP / UDP / ICMP / ICMPv6` 基础解析
 - 已支持五元组 flow 聚合
-- 已支持 `IP / Port` 对象级聚合
+- 已支持 `IP / Port / Domain` 对象级聚合
+- 已支持 `DNS` 最小解析
+- 已支持 `TLS ClientHello / SNI` 最小解析
 - 已支持 JSONL 落盘到 Android App 私有目录
-- 已验证在真机上可捕获真实业务流量，而不仅是占位包
+- 已支持基于 `getConnectionOwnerUid(...)` 的应用归因闭环
+- 已支持单应用 / 多应用 VPN 选择
+- 已接入 Android 原生 `hev-socks5-server + hev-socks5-tunnel`，开启探针后浏览器可继续联网
 
-当前已知边界与未完成项：
+当前项目已经形成两种运行模式：
 
-- 逐 flow 的应用归因仍未稳定命中，日志中仍会出现 `app=unattributed`
-- 应用层协议解析还处于起步阶段，`DNS / TLS SNI / HTTP` 解析尚未正式接入主链路
-- 当前日志较偏调试风格，还没有整理为更适合长期运行的状态输出
-- UI 仍是占位骨架，当前阶段以主链路和分析内核为主
+- `capture mode`
+  - 由 Rust 直接读取 TUN
+  - 适合做流量分析、协议解析、归因和 JSONL 落盘
+  - 缺点是当前不会转发流量，开启后业务网络会中断
+- `forwarding mode`
+  - 由 Android 侧本地 `SOCKS5 server` + `tun2socks` 接管 TUN
+  - 适合恢复真实联网能力，已在真机上验证通过
+  - 当前暂停了 Rust 的原始 TUN 抓包，分析能力还没有重新挂回转发链侧
+
+当前最重要的已知边界：
+
+- `capture mode` 和 `forwarding mode` 还没有合并成“既不断网又保留完整 Rust 分析”的单一路径
+- 转发模式下目前只有转发统计，还没有把 `DNS / SNI / flow` 重新接回结构化分析输出
+- `HTTP` 明文请求解析仍未接入主链路
+- UI 仍是占位骨架，当前重点仍在底层链路与内核能力
+- 测试体系仍然很薄，`cargo test` 与 Android 构建已通过，但工作区里仍缺少实质性的单元测试和集成测试
+
+阶段判断：
+
+- `P0 稳定化与可观测性`：已完成基础版
+- `P1 应用归因`：主链路已打通
+- `P2 应用层解析`：`DNS` 与 `TLS SNI` 已完成最小可用版
+- `P3 转发链路`：Android 原生转发已打通最小可用版
+- 下一阶段重点：把分析能力重新挂回转发模式，形成“可联网 + 可分析”的统一主链路
 
 相关实现文档：
 
 - 架构说明：[docs/architecture.md](docs/architecture.md)
 - Android 打包说明：[docs/android-apk-build.md](docs/android-apk-build.md)
 - 下一阶段计划：[docs/next-step-plan.md](docs/next-step-plan.md)
+
+## 快速现状总览
+
+当前最接近真实可用的路径是 Android `forwarding mode`：
+
+```text
+App traffic
+  -> Android VPN TUN
+  -> hev-socks5-tunnel
+  -> local hev-socks5-server (127.0.0.1:1080)
+  -> protected outbound sockets
+  -> Internet
+```
+
+当前最接近分析内核验证的路径是 Rust `capture mode`：
+
+```text
+App traffic
+  -> Android VPN TUN
+  -> Rust capture thread
+  -> parse / flow / attrib / object agg / JSONL
+```
+
+如果你只关心“现在项目到了哪一步”，可以概括成一句话：
+
+**RustProbe 现在已经不是纸面设计，而是一个能在 Android 真机上跑起来、能转发真实流量、也能做基础 DNS/TLS 分析的原型内核；当前最大的工作是把‘转发’和‘分析’重新合并成同一条稳定主链路。**
 
 ## 1. 项目目标
 

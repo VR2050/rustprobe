@@ -19,10 +19,18 @@ impl AppSelectionMode {
                 .map(|app| app.package_name == *package_name)
                 .unwrap_or(false),
             Self::Multiple(package_names) | Self::AllowList(package_names) => app
-                .map(|app| package_names.iter().any(|package| package == &app.package_name))
+                .map(|app| {
+                    package_names
+                        .iter()
+                        .any(|package| package == &app.package_name)
+                })
                 .unwrap_or(false),
             Self::DenyList(package_names) => app
-                .map(|app| package_names.iter().all(|package| package != &app.package_name))
+                .map(|app| {
+                    package_names
+                        .iter()
+                        .all(|package| package != &app.package_name)
+                })
                 .unwrap_or(true),
         }
     }

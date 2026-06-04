@@ -7,7 +7,7 @@ pub use actor::{Actor, ActorRef};
 pub use config::{AppSelectionMode, RuntimeConfig};
 pub use event::{AlertEvent, AppEvent, ControlEvent, FlowEvent, PacketEvent, UiEvent};
 pub use model::{
-    now_unix_ms, AlertRecord, AppIdentity, AppMetricsSnapshot, FlowRecord, IpVersion,
-    NetworkEndpoint, FlowKey, FlowOwnerQuery, FlowOwnerResolution, FlowState, ObjectKey,
-    ObjectKind, ObjectRecord, ObjectState, ParsedPacket, ProtocolHint, RiskLevel,
+    AlertRecord, AppIdentity, AppMetricsSnapshot, FlowKey, FlowOwnerQuery, FlowOwnerResolution,
+    FlowRecord, FlowState, IpVersion, NetworkEndpoint, ObjectKey, ObjectKind, ObjectRecord,
+    ObjectState, ParsedPacket, ProtocolHint, RiskLevel, now_unix_ms,
 };

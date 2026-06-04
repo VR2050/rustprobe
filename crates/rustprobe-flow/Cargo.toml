@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 rustprobe-core = { path = "../rustprobe-core" }
+rustprobe-parse = { path = "../rustprobe-parse" }
