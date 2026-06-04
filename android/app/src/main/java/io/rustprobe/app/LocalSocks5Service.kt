@@ -43,6 +43,8 @@ class LocalSocks5Service : Service() {
         if (started) return
 
         val configFile = File(cacheDir, "rustprobe-socks5.conf")
+        val outputDir = File(filesDir, "rustprobe-output").apply { mkdirs() }
+        val logFile = File(outputDir, "forwarding-socks5.log")
         FileOutputStream(configFile, false).use { output ->
             output.write(
                 buildString {
@@ -58,7 +60,7 @@ class LocalSocks5Service : Service() {
                     appendLine("  bind-interface: ''")
                     appendLine("misc:")
                     appendLine("  task-stack-size: 24576")
-                    appendLine("  log-file: stderr")
+                    appendLine("  log-file: '${logFile.absolutePath}'")
                     appendLine("  log-level: info")
                 }.toByteArray(),
             )

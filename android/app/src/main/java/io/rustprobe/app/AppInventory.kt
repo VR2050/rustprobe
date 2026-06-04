@@ -29,4 +29,15 @@ object AppInventory {
             isSystemApp = info.flags and ApplicationInfo.FLAG_SYSTEM != 0,
         )
     }
+
+    fun findAppByPackage(context: Context, packageName: String): InstalledAppInfo? {
+        val pm = context.packageManager
+        val info = runCatching { pm.getApplicationInfo(packageName, 0) }.getOrNull() ?: return null
+        return InstalledAppInfo(
+            uid = info.uid,
+            packageName = packageName,
+            appLabel = pm.getApplicationLabel(info).toString(),
+            isSystemApp = info.flags and ApplicationInfo.FLAG_SYSTEM != 0,
+        )
+    }
 }

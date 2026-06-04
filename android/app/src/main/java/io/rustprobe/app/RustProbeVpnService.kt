@@ -36,6 +36,7 @@ class RustProbeVpnService : VpnService() {
     private var ownerResolutionHitCount = 0L
     @Volatile
     private var ownerResolutionMissCount = 0L
+    private var forwardingRecorder: ForwardingObservationRecorder? = null
     private val ownerResolver: ConnectionOwnerResolver by lazy {
         ConnectionOwnerResolver(
             getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager,
@@ -100,6 +101,7 @@ class RustProbeVpnService : VpnService() {
     private fun startForwardingVpn(): Int {
         RustBridge.nativeStopCapture()
         ownerPolling = false
+        forwardingRecorder = ForwardingObservationRecorder(this, MonitoringPreferences.selection)
         startLocalSocksProxy()
 
         if (tunInterface == null) {
@@ -125,13 +127,14 @@ class RustProbeVpnService : VpnService() {
         }
 
         val configFile = File(cacheDir, "rustprobe-tproxy.yml")
+        val tproxyLogPath = forwardingRecorder?.tproxyLogPath() ?: File(filesDir, "rustprobe-output/forwarding-tproxy.log").absolutePath
         FileOutputStream(configFile, false).use { output ->
             output.write(
                 buildString {
                     appendLine("misc:")
                     appendLine("  task-stack-size: 24576")
                     appendLine("  tcp-buffer-size: 4096")
-                    appendLine("  log-file: stderr")
+                    appendLine("  log-file: '$tproxyLogPath'")
                     appendLine("  log-level: info")
                     appendLine("tunnel:")
                     appendLine("  mtu: 1500")
@@ -181,6 +184,8 @@ class RustProbeVpnService : VpnService() {
         thread(name = "rustprobe-forwarding-status", isDaemon = true) {
             while (forwardingStatusPolling) {
                 val stats = runCatching { TProxyGetStats() }.getOrNull()
+                runCatching { forwardingRecorder?.poll() }
+                    .onFailure { Log.w("RustProbeVpnService", "Failed to poll forwarding recorder", it) }
                 Log.i(
                     "RustProbeVpnService",
                     "forwarding status txPackets=${stats?.getOrNull(0) ?: -1} txBytes=${stats?.getOrNull(1) ?: -1} rxPackets=${stats?.getOrNull(2) ?: -1} rxBytes=${stats?.getOrNull(3) ?: -1}",
