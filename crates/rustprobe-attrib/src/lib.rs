@@ -69,7 +69,12 @@ impl AttributionActor {
     }
 
     pub fn attribute_flow(&self, flow: &FlowState, owning_uid: Option<u32>) -> Option<AppIdentity> {
-        let cached_uid = self.flow_owner_cache.get(&flow.key).copied();
+        let reversed_key = reverse_flow_key(&flow.key);
+        let cached_uid = self
+            .flow_owner_cache
+            .get(&flow.key)
+            .copied()
+            .or_else(|| self.flow_owner_cache.get(&reversed_key).copied());
         let app = cached_uid
             .or(owning_uid)
             .and_then(|uid| self.uid_catalog.get(&uid).cloned())
@@ -87,13 +92,21 @@ impl AttributionActor {
     }
 
     pub fn register_flow_owner(&mut self, key: FlowKey, uid: u32) {
+        let reversed_key = reverse_flow_key(&key);
         self.pending_owner_keys.remove(&key);
+        self.pending_owner_keys.remove(&reversed_key);
         self.flow_owner_cache.insert(key, uid);
+        self.flow_owner_cache.insert(reversed_key, uid);
         self.total_owner_resolutions += 1;
     }
 
     pub fn queue_owner_query(&mut self, key: FlowKey) -> bool {
-        if self.flow_owner_cache.contains_key(&key) || self.pending_owner_keys.contains(&key) {
+        let reversed_key = reverse_flow_key(&key);
+        if self.flow_owner_cache.contains_key(&key)
+            || self.flow_owner_cache.contains_key(&reversed_key)
+            || self.pending_owner_keys.contains(&key)
+            || self.pending_owner_keys.contains(&reversed_key)
+        {
             self.total_owner_queries_skipped += 1;
             return false;
         }
@@ -155,6 +168,16 @@ impl AttributionActor {
             }
             _ => None,
         }
+    }
+}
+
+fn reverse_flow_key(key: &FlowKey) -> FlowKey {
+    FlowKey {
+        src_addr: key.dst_addr.clone(),
+        dst_addr: key.src_addr.clone(),
+        src_port: key.dst_port,
+        dst_port: key.src_port,
+        protocol: key.protocol.clone(),
     }
 }
 

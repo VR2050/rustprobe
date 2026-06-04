@@ -2,7 +2,7 @@ use rustprobe_core::{
     AppIdentity, FlowKey, FlowState, ObjectKey, ObjectKind, ObjectState, ParsedPacket, now_unix_ms,
 };
 use rustprobe_parse::parse_tls_client_hello_server_name;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_FLOW_IDLE_TIMEOUT_MS: u128 = 60_000;
 const TLS_BUFFER_LIMIT_BYTES: usize = 4096;
@@ -22,6 +22,7 @@ pub struct FlowIngestResult {
     pub active_flows: usize,
     pub expired_flows: usize,
     pub top_objects: Vec<ObjectState>,
+    pub touched_objects: Vec<ObjectState>,
 }
 
 impl FlowActor {
@@ -78,7 +79,7 @@ impl FlowActor {
             });
         }
 
-        self.update_objects(packet, derived_tls_server_name.as_deref());
+        let touched_objects = self.update_objects(packet, derived_tls_server_name.as_deref());
         let expired_flows = self.expire_idle_flows();
         let top_objects = self.top_objects(4);
 
@@ -87,6 +88,7 @@ impl FlowActor {
             active_flows: self.active_flows(),
             expired_flows,
             top_objects,
+            touched_objects,
         })
     }
 
@@ -126,50 +128,89 @@ impl FlowActor {
         before.saturating_sub(self.table.len())
     }
 
-    fn update_objects(&mut self, packet: &ParsedPacket, derived_tls_server_name: Option<&str>) {
+    fn update_objects(
+        &mut self,
+        packet: &ParsedPacket,
+        derived_tls_server_name: Option<&str>,
+    ) -> Vec<ObjectState> {
         let active_flows = self.active_flows();
+        let mut touched = Vec::new();
+        let mut seen_keys = HashSet::new();
         let ip_key = ObjectKey {
             kind: ObjectKind::Ip,
             value: packet.dst_addr.clone(),
         };
-        self.objects
-            .entry(ip_key.clone())
-            .and_modify(|entry| entry.update(packet.payload_len, active_flows))
-            .or_insert_with(|| ObjectState::new(ip_key, packet.payload_len, active_flows));
+        touched.push(self.upsert_object(ip_key, packet.payload_len, active_flows));
 
         if let Some(dst_port) = packet.dst_port {
             let port_key = ObjectKey {
                 kind: ObjectKind::Port,
                 value: dst_port.to_string(),
             };
-            self.objects
-                .entry(port_key.clone())
-                .and_modify(|entry| entry.update(packet.payload_len, active_flows))
-                .or_insert_with(|| ObjectState::new(port_key, packet.payload_len, active_flows));
+            touched.push(self.upsert_object(port_key, packet.payload_len, active_flows));
         }
 
         if let Some(domain) = packet.dns_query_name.as_ref() {
-            self.update_domain_object(domain.clone(), packet.payload_len, active_flows);
+            Self::push_unique_object(
+                &mut touched,
+                &mut seen_keys,
+                self.update_domain_object(domain.clone(), packet.payload_len, active_flows),
+            );
         }
 
         if let Some(server_name) = packet.tls_server_name.as_ref() {
-            self.update_domain_object(server_name.clone(), packet.payload_len, active_flows);
+            Self::push_unique_object(
+                &mut touched,
+                &mut seen_keys,
+                self.update_domain_object(server_name.clone(), packet.payload_len, active_flows),
+            );
         }
 
         if let Some(server_name) = derived_tls_server_name {
-            self.update_domain_object(server_name.to_string(), packet.payload_len, active_flows);
+            Self::push_unique_object(
+                &mut touched,
+                &mut seen_keys,
+                self.update_domain_object(
+                    server_name.to_string(),
+                    packet.payload_len,
+                    active_flows,
+                ),
+            );
         }
+
+        touched
     }
 
-    fn update_domain_object(&mut self, domain: String, bytes: usize, active_flows: usize) {
+    fn update_domain_object(
+        &mut self,
+        domain: String,
+        bytes: usize,
+        active_flows: usize,
+    ) -> ObjectState {
         let domain_key = ObjectKey {
             kind: ObjectKind::Domain,
             value: domain,
         };
-        self.objects
-            .entry(domain_key.clone())
+        self.upsert_object(domain_key, bytes, active_flows)
+    }
+
+    fn upsert_object(&mut self, key: ObjectKey, bytes: usize, active_flows: usize) -> ObjectState {
+        let entry = self
+            .objects
+            .entry(key.clone())
             .and_modify(|entry| entry.update(bytes, active_flows))
-            .or_insert_with(|| ObjectState::new(domain_key, bytes, active_flows));
+            .or_insert_with(|| ObjectState::new(key, bytes, active_flows));
+        entry.clone()
+    }
+
+    fn push_unique_object(
+        objects: &mut Vec<ObjectState>,
+        seen_keys: &mut HashSet<ObjectKey>,
+        object: ObjectState,
+    ) {
+        if seen_keys.insert(object.key.clone()) {
+            objects.push(object);
+        }
     }
 
     fn maybe_extract_tls_server_name(

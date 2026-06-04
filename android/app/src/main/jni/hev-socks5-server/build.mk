@@ -7,11 +7,11 @@ rwildcard=$(foreach d,$(wildcard $1*), \
 SRCFILES=$(call rwildcard,$(SRCDIR)/,*.c *.S)
 
 ifeq ($(REV_ID),)
-  ifneq (,$(wildcard .rev-id))
-    REV_ID=$(shell cat .rev-id)
+  ifneq (,$(wildcard $(SRCDIR)/.rev-id))
+    REV_ID=$(shell cat $(SRCDIR)/.rev-id)
   endif
   ifeq ($(REV_ID),)
-    REV_ID=$(shell git -C $(SRCDIR) rev-parse --short HEAD)
+    REV_ID=$(shell git -C $(SRCDIR) rev-parse --short HEAD 2>/dev/null)
   endif
   ifeq ($(REV_ID),)
     REV_ID=unknown

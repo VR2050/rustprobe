@@ -229,8 +229,7 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
                                             ));
                                         }
 
-                                        let objects = flow_actor.object_snapshot();
-                                        if let Err(err) = store.append_objects(&objects) {
+                                        if let Err(err) = store.append_objects(&flow.touched_objects) {
                                             log_error(format!(
                                                 "failed to persist object snapshot: {err}"
                                             ));

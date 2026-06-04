@@ -52,7 +52,6 @@ pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeIsCaptureRunning(
     as_jboolean(is_capture_running())
 }
 
-
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativePacketsSeen(
     _env: JNIEnv<'_>,

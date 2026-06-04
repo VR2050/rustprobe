@@ -32,15 +32,19 @@ Responsibilities:
 - host `MainActivity`
 - own `RustProbeVpnService`
 - manage app selection mode
-- pass TUN file descriptor to Rust via JNI later
+- sync installed apps and monitoring selection into Rust runtime
+- choose between `capture mode` and `forwarding mode`
+- pass TUN file descriptor to Rust or native forwarding components
 
 ### 2.2 Transport and VPN layer
 
 Responsibilities:
 
 - create TUN interface
-- exclude relay sockets with `protect()`
+- support direct Rust capture from TUN
+- support `hev-socks5-server + hev-socks5-tunnel` forwarding for real connectivity
 - maintain Android-compatible network access while traffic is inspected
+- emit minimal forwarding-side observability when Rust is not reading raw TUN packets
 
 ### 2.3 Rust analysis layer
 
@@ -136,6 +140,28 @@ The next iteration should add:
 - `RelayEvent`
 - `SessionEvent`
 
+### 5.3 Current forwarding-side event output
+
+When `forwarding mode` is enabled, the app currently emits a lightweight JSONL stream derived from native forwarding logs.
+
+Current fields include:
+
+- `event_seq`
+- `session_id`
+- `session_started_at_ms`
+- `observed_at_ms`
+- `timestamp`
+- `source`
+- `transport`
+- `host`
+- `port`
+- `object_kind`
+- `selection_mode`
+- `monitored_packages`
+- optional single-app attribution fields when running in single-app mode
+
+This output is intentionally smaller than the Rust flow/object snapshots. It exists to preserve basic observability while forwarding is active.
+
 ## 6. Data Model
 
 Current shared models live in `rustprobe-core/src/model.rs`.
@@ -179,37 +205,52 @@ Not guaranteed:
 
 ## 7. End-to-End Processing Path
 
+The project currently has two real runtime paths.
+
+### 7.1 Capture mode
+
 1. Android requests VPN permission.
 2. `RustProbeVpnService` creates TUN.
-3. TUN fd is passed to Rust core.
-4. `TunCaptureActor` ingests packets.
-5. `rustprobe-parse` parses IPv4/IPv6/TCP/UDP.
+3. TUN fd is passed through JNI into Rust.
+4. `TunCaptureActor` / capture thread ingests packets.
+5. `rustprobe-parse` parses IPv4/IPv6/TCP/UDP and extracts DNS/TLS hints.
 6. `FlowActor` creates or updates flow state.
-7. `AttributionActor` maps to UID/package/app.
-8. object aggregation extracts domain/URL/IP/port/`MAC` metadata.
-9. `MetricsActor` computes app-level load signals.
-10. `DetectionActor` checks malicious outbound and mining indicators.
-11. `StorageActor` records exportable artifacts.
-12. `UiGatewayActor` pushes summaries to UI.
+7. attribution runtime maps to UID/package/app and may enqueue Android owner queries.
+8. object aggregation extracts IP/port/domain metadata.
+9. JSONL storage writes flow and object snapshots.
 
-## 8. Android Integration Plan
+### 7.2 Forwarding mode
 
-### 8.1 Current skeleton
+1. Android requests VPN permission.
+2. `RustProbeVpnService` creates TUN.
+3. `LocalSocks5Service` starts local `hev-socks5-server`.
+4. native `hev-socks5-tunnel` binds to the TUN fd and forwards traffic through the local SOCKS5 server.
+5. Android keeps outbound connectivity while VPN interception stays active.
+6. `ForwardingObservationRecorder` tails forwarding logs and emits `forwarding-events.jsonl`.
 
-Current Android host provides:
+The main architectural gap is that these two paths are not yet merged into one unified "forward + full Rust analysis" pipeline.
 
-- Gradle project layout
+## 8. Android Integration Status
+
+### 8.1 Implemented now
+
+Current Android host already provides:
+
+- Gradle APK packaging with Rust JNI build hooks
 - launcher activity
-- placeholder VPN service
-- manifest and theme files
+- `RustProbeVpnService`
+- app inventory sync into Rust
+- single-app / multi-app VPN selection
+- owner UID resolution via `getConnectionOwnerUid(...)`
+- local SOCKS5 service startup and shutdown
+- forwarding-mode status polling and minimal forwarding event recording
 
 ### 8.2 Next implementation steps
 
-1. add JNI bridge for Rust startup
-2. hand TUN file descriptor to Rust
-3. add app allow/deny configuration
-4. add runtime status display
-5. add service start/stop controls
+1. merge forwarding and Rust analysis into one primary path
+2. expose runtime mode and health in a real UI instead of a text placeholder
+3. add explicit service start/stop and mode-switch controls
+4. make forwarding-side events and Rust-side events share a more uniform schema
 
 ## 9. UI Integration Plan
 
@@ -220,6 +261,8 @@ Current UI shell provides:
 - Vite + TypeScript placeholder
 - HTML entry point
 - dashboard placeholder content
+
+The Android activity is also still a placeholder text view. There is no production UI flow yet for browsing flows, objects, or alerts.
 
 ### 9.2 Next implementation steps
 
@@ -246,12 +289,12 @@ Planned backing stores:
 
 ## 11. Gaps Remaining
 
-The scaffold is now structurally complete for early development, but still missing:
+The project is no longer just a scaffold. The main remaining gaps are:
 
-- real TUN fd handoff
-- real `pnet` packet parsing
-- real attribution on Android
-- real UI transport
-- real persistence format implementation
+- `capture mode` and `forwarding mode` are still split
+- forwarding mode does not yet emit full Rust flow/object analysis
+- UI transport and UI screens are still mostly placeholder-level
+- test coverage is still extremely thin
+- storage output is usable JSONL, but not yet a stable long-term event contract across all modes
 
-Those gaps are now implementation gaps, not layout gaps.
+The dominant work now is integration and stabilization rather than repository scaffolding.
