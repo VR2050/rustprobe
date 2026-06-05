@@ -10,8 +10,10 @@
 #include <errno.h>
 #include <assert.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <dlfcn.h>
 
 #include <lwip/tcp.h>
 #include <lwip/udp.h>
@@ -44,6 +46,7 @@ static int tun_fd = -1;
 static int tun_fd_local;
 static int session_count;
 static int event_fds[2] = { -1, -1 };
+static void *rustprobe_ffi_handle;
 
 static size_t stat_tx_packets;
 static size_t stat_rx_packets;
@@ -59,6 +62,80 @@ static HevTask *task_event;
 static HevTask *task_lwip_io;
 static HevTask *task_lwip_timer;
 static HevList session_set;
+static int rustprobe_ingest_lookup_attempted;
+
+typedef void (*RustProbeForwardCaptureIngestPacket) (const unsigned char *data,
+                                                     size_t len);
+
+static RustProbeForwardCaptureIngestPacket rustprobe_ingest_packet;
+
+static RustProbeForwardCaptureIngestPacket
+rustprobe_resolve_ingest_symbol (void)
+{
+    RustProbeForwardCaptureIngestPacket packet_fn;
+
+    if (!rustprobe_ffi_handle) {
+        rustprobe_ffi_handle =
+            dlopen ("librustprobe_ffi.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!rustprobe_ffi_handle) {
+            LOG_W ("rustprobe mirror dlopen failed: %s", dlerror ());
+            return NULL;
+        }
+    }
+
+    dlerror ();
+    packet_fn = (RustProbeForwardCaptureIngestPacket)dlsym (
+        rustprobe_ffi_handle, "rustprobe_forward_capture_ingest_packet");
+    if (!packet_fn) {
+        LOG_W ("rustprobe mirror dlsym failed: %s", dlerror ());
+        return NULL;
+    }
+
+    LOG_I ("rustprobe mirror symbol resolved");
+    return packet_fn;
+}
+
+static void
+rustprobe_forward_capture_ingest_raw (const unsigned char *data, size_t len)
+{
+    if (!data || !len)
+        return;
+
+    if (!rustprobe_ingest_lookup_attempted) {
+        rustprobe_ingest_packet = rustprobe_resolve_ingest_symbol ();
+        rustprobe_ingest_lookup_attempted = 1;
+        if (!rustprobe_ingest_packet)
+            LOG_W ("rustprobe mirror symbol unavailable");
+    }
+
+    if (rustprobe_ingest_packet)
+        rustprobe_ingest_packet (data, len);
+}
+
+static void
+rustprobe_forward_capture_ingest_pbuf (struct pbuf *p)
+{
+    unsigned char *buf;
+    u16_t len;
+
+    if (!p)
+        return;
+
+    if (!p->next) {
+        rustprobe_forward_capture_ingest_raw (p->payload, p->len);
+        return;
+    }
+
+    len = p->tot_len;
+    buf = malloc (len);
+    if (!buf)
+        return;
+
+    if (pbuf_copy_partial (p, buf, len, 0) == len)
+        rustprobe_forward_capture_ingest_raw (buf, len);
+
+    free (buf);
+}
 
 static int
 task_io_yielder (HevTaskYieldType type, void *data)
@@ -72,6 +149,8 @@ static err_t
 netif_output_handler (struct netif *netif, struct pbuf *p)
 {
     ssize_t s;
+
+    rustprobe_forward_capture_ingest_pbuf (p);
 
     s = hev_tunnel_write (tun_fd, p);
     if (s <= 0) {
@@ -312,6 +391,7 @@ lwip_io_task_entry (void *data)
 
         stat_tx_packets++;
         stat_tx_bytes += buf->tot_len;
+        rustprobe_forward_capture_ingest_pbuf (buf);
 
         hev_task_mutex_lock (&mutex);
         if (netif.input (buf, &netif) != ERR_OK)

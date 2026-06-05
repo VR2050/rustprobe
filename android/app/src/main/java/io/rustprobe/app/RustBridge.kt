@@ -15,6 +15,7 @@ object RustBridge {
     }
 
     external fun nativeStartCapture(fd: Int): Boolean
+    external fun nativeStartMirroredCapture(): Boolean
     external fun nativeStopCapture()
     external fun nativeIsCaptureRunning(): Boolean
     external fun nativePacketsSeen(): Int

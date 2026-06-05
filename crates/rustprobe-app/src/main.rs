@@ -1,6 +1,8 @@
 use rustprobe_attrib::AttributionActor;
 use rustprobe_capture::TunCaptureActor;
-use rustprobe_core::{AppIdentity, AppSelectionMode, IpVersion, ParsedPacket};
+use rustprobe_core::{
+    AppIdentity, AppSelectionMode, IpVersion, ParsedPacket, TrafficDispositionMode,
+};
 use rustprobe_detect::DetectionActor;
 use rustprobe_flow::FlowActor;
 use rustprobe_ipc::UiGatewayActor;
@@ -12,6 +14,10 @@ use rustprobe_store::StorageActor;
 async fn main() -> anyhow::Result<()> {
     let capture = TunCaptureActor;
     let parser = ParserStage;
+    let runtime_config = rustprobe_core::RuntimeConfig {
+        disposition_mode: TrafficDispositionMode::Forward,
+        ..Default::default()
+    };
     let mut attrib = AttributionActor::default();
     attrib.register_apps([AppIdentity {
         uid: 10_001,
@@ -78,6 +84,9 @@ async fn main() -> anyhow::Result<()> {
         println!("published ui event: {}", ui_event.topic);
     }
 
-    println!("workspace bootstrap complete");
+    println!(
+        "workspace bootstrap complete ({})",
+        runtime_config.disposition_mode.as_str()
+    );
     Ok(())
 }

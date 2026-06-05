@@ -7,6 +7,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -38,6 +39,7 @@ class MainActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var autoRefreshEnabled = false
     private var manuallyStopped = false
+    private var serviceStartInFlight = false
     private val refreshTicker = object : Runnable {
         override fun run() {
             refreshDashboard()
@@ -62,6 +64,7 @@ class MainActivity : ComponentActivity() {
     private val appCheckBoxes = linkedMapOf<String, CheckBox>()
     private val selectedPackages = linkedSetOf<String>()
     private val trafficRefreshVersion = AtomicInteger(0)
+    private val summaryRefreshVersion = AtomicInteger(0)
     private var appSelectionMode = UiSelectionMode.Global
 
     private var forwardingRadio: RadioButton? = null
@@ -162,12 +165,12 @@ class MainActivity : ComponentActivity() {
             forwardingRadio = RadioButton(this@MainActivity).apply {
                 text = "Forward"
                 id = View.generateViewId()
-                isChecked = MonitoringPreferences.forwardingEnabled
+                isChecked = MonitoringPreferences.mode == MonitoringMode.Forward
             }
             captureRadio = RadioButton(this@MainActivity).apply {
                 text = "Capture"
                 id = View.generateViewId()
-                isChecked = !MonitoringPreferences.forwardingEnabled
+                isChecked = MonitoringPreferences.mode == MonitoringMode.Capture
             }
             modeGroup.addView(forwardingRadio)
             modeGroup.addView(captureRadio)
@@ -300,10 +303,12 @@ class MainActivity : ComponentActivity() {
                         refreshDashboard()
                     })
                     addView(actionButton("启动/重启监听") {
+                        if (serviceStartInFlight) return@actionButton
                         applyCurrentSelection()
                         requestVpnAndStart()
                     })
                     addView(actionButton("停止监听") {
+                        serviceStartInFlight = false
                         manuallyStopped = true
                         stopService(Intent(this@MainActivity, RustProbeVpnService::class.java))
                         stopAutoRefresh()
@@ -579,16 +584,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun applyCurrentSelection() {
-        val forwardingEnabled = forwardingRadio?.isChecked == true
+        val monitoringMode = if (forwardingRadio?.isChecked == true) {
+            MonitoringMode.Forward
+        } else {
+            MonitoringMode.Capture
+        }
         val selection = buildSelectionFromUi()
-        MonitoringPreferences.forwardingEnabled = forwardingEnabled
+        MonitoringPreferences.mode = monitoringMode
         MonitoringPreferences.selection = selection
         val syncedApps = syncAppsIntoRust(installedApps)
         val syncedSelection = RustBridge.setMonitoringSelection(selection)
 
         statusTextView?.text = buildString {
             append("已应用配置：模式=")
-            append(if (forwardingEnabled) "Forward" else "Capture")
+            append(monitoringMode.name)
             append("，选择=")
             append(selectionSummary(selection))
             append("，syncInstalledApps=")
@@ -597,7 +606,7 @@ class MainActivity : ComponentActivity() {
             append(syncedSelection)
             append("。如果 VPN 已经在运行，请点“启动/重启监听”让新配置生效。")
         }
-        updateStatusChip(if (forwardingEnabled) "Forward 已配置" else "Capture 已配置", false)
+        updateStatusChip("${monitoringMode.name} 已配置", false)
     }
 
     private fun requestVpnAndStart() {
@@ -610,19 +619,41 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startVpnService() {
+        if (serviceStartInFlight) return
+        serviceStartInFlight = true
         manuallyStopped = false
-        startService(Intent(this, RustProbeVpnService::class.java))
-        statusTextView?.text = "已请求启动 VPN 监听服务。"
-        updateStatusChip("监听启动中", false)
-        startAutoRefresh()
-        refreshDashboard()
+        runCatching {
+            val intent = Intent(this, RustProbeVpnService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        }.onSuccess {
+            statusTextView?.text = "已请求启动 VPN 监听服务。正在等待运行态刷新..."
+            updateStatusChip("监听启动中", false)
+            startAutoRefresh()
+            handler.postDelayed(
+                {
+                    serviceStartInFlight = false
+                    refreshDashboard()
+                },
+                800L,
+            )
+        }.onFailure { error ->
+            serviceStartInFlight = false
+            statusTextView?.text = "启动 VPN 监听失败：${error.message}"
+            updateStatusChip("启动失败", false)
+            Log.e("RustProbeMainActivity", "Failed to start VPN service", error)
+        }
     }
 
     private fun refreshDashboard() {
-        flowModeHintTextView?.text = if (forwardingRadio?.isChecked == true) {
-            "Forward：优先保证不断网，同时输出轻量 forwarding 事件；当前还不是完整 Rust 分析链路。"
-        } else {
-            "Capture：让 Rust 直接读取 TUN，能拿到更完整的 flow、DNS、SNI 和归因；当前版本下可能影响联网。"
+        flowModeHintTextView?.text = when {
+            forwardingRadio?.isChecked == true ->
+                "Forward：走共享 Rust 解析链，默认动作是捕获全部并继续转发。"
+            else ->
+                "Capture：也走共享 Rust 解析链，默认偏向抓取，后面可以扩成自定义转发策略。"
         }
 
         updateSelectedAppsSummary()
@@ -632,70 +663,76 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshSummary() {
-        val packetsSeen = runCatching { RustBridge.nativePacketsSeen() }.getOrDefault(-1)
-        val captureRunning = runCatching { RustBridge.nativeIsCaptureRunning() }.getOrDefault(false)
-        val selectionSummary = runCatching { RustBridge.nativeSelectionSummary() }.getOrDefault("unavailable")
-        val attribution = runCatching { RustBridge.attributionStats() }.getOrNull()
-        val outputDir = File(filesDir, "rustprobe-output")
-        val flowCoverage = computeFlowCoverageStats(
-            readLastJsonObjects(File(outputDir, "flows.jsonl"), limit = 240),
-        )
+        val refreshVersion = summaryRefreshVersion.incrementAndGet()
+        summaryTextView?.text = "正在刷新摘要统计..."
 
-        summaryTextView?.text = buildString {
-            appendLine("模式: ${if (MonitoringPreferences.forwardingEnabled) "Forward" else "Capture"}")
-            appendLine(
-                if (MonitoringPreferences.forwardingEnabled) {
-                    "抓包线程运行中: $captureRunning（当前是 Forward，这里显示 false 是正常的）"
-                } else {
-                    "抓包线程运行中: $captureRunning"
-                },
+        thread(name = "rustprobe-ui-summary-refresh", isDaemon = true) {
+            val packetsSeen = runCatching { RustBridge.nativePacketsSeen() }.getOrDefault(-1)
+            val captureRunning = runCatching { RustBridge.nativeIsCaptureRunning() }.getOrDefault(false)
+            val selectionSummary = runCatching { RustBridge.nativeSelectionSummary() }.getOrDefault("unavailable")
+            val attribution = runCatching { RustBridge.attributionStats() }.getOrNull()
+            val outputDir = File(filesDir, "rustprobe-output")
+            val flowCoverage = computeFlowCoverageStats(
+                readLastJsonObjects(File(outputDir, "flows.jsonl"), limit = 160),
             )
-            appendLine("已见数据包数: $packetsSeen")
-            appendLine("当前选择: $selectionSummary")
-            appendLine("输出目录: ${outputDir.absolutePath}")
-            appendLine("forwarding-events.jsonl: ${File(outputDir, "forwarding-events.jsonl").length()} bytes")
-            appendLine("flows.jsonl: ${File(outputDir, "flows.jsonl").length()} bytes")
-            appendLine("objects.jsonl: ${File(outputDir, "objects.jsonl").length()} bytes")
-            if (attribution != null) {
-                appendLine("已跟踪应用数: ${attribution.trackedApps}")
+
+            val summaryText = buildString {
+                appendLine("模式: ${MonitoringPreferences.mode.name}")
                 appendLine(
-                    if (MonitoringPreferences.forwardingEnabled) {
-                        "缓存 flow owner 数: ${attribution.cachedFlowOwners}（Forward 下通常会偏低或为 0，因为 Rust 没有直接读完整 TUN flow）"
+                    if (MonitoringPreferences.mode == MonitoringMode.Forward) {
+                        "共享解析链运行中（Forward 默认转发）: $captureRunning"
                     } else {
-                        "缓存 flow owner 数: ${attribution.cachedFlowOwners}"
+                        "共享解析链运行中（Capture 默认抓取）: $captureRunning"
                     },
                 )
-                appendLine("待处理 owner 查询: ${attribution.pendingOwnerQueries}")
-                appendLine("已入队 owner 查询: ${attribution.totalOwnerQueriesEnqueued}")
-                appendLine("已取出 owner 查询: ${attribution.totalOwnerQueriesDrained}")
-                appendLine("已跳过 owner 查询: ${attribution.totalOwnerQueriesSkipped}")
-                appendLine("owner 解析成功数: ${attribution.totalOwnerResolutions}")
-            } else {
-                appendLine("归因统计: 暂不可用")
+                appendLine("已见数据包数: $packetsSeen")
+                appendLine("当前选择: $selectionSummary")
+                appendLine("输出目录: ${outputDir.absolutePath}")
+                appendLine("forwarding-events.jsonl: ${File(outputDir, "forwarding-events.jsonl").length()} bytes")
+                appendLine("flows.jsonl: ${File(outputDir, "flows.jsonl").length()} bytes")
+                appendLine("objects.jsonl: ${File(outputDir, "objects.jsonl").length()} bytes")
+                if (attribution != null) {
+                    appendLine("已跟踪应用数: ${attribution.trackedApps}")
+                    appendLine("缓存 flow owner 数: ${attribution.cachedFlowOwners}")
+                    appendLine("待处理 owner 查询: ${attribution.pendingOwnerQueries}")
+                    appendLine("已入队 owner 查询: ${attribution.totalOwnerQueriesEnqueued}")
+                    appendLine("已取出 owner 查询: ${attribution.totalOwnerQueriesDrained}")
+                    appendLine("已跳过 owner 查询: ${attribution.totalOwnerQueriesSkipped}")
+                    appendLine("owner 解析成功数: ${attribution.totalOwnerResolutions}")
+                } else {
+                    appendLine("归因统计: 暂不可用")
+                }
+                appendLine()
+                appendLine("最近 flow 命中统计:")
+                appendLine("唯一 flow 数: ${flowCoverage.uniqueFlows}")
+                appendLine(
+                    "带域名 flow: ${flowCoverage.domainFlows}" +
+                        formatRate(flowCoverage.domainFlows, flowCoverage.uniqueFlows),
+                )
+                appendLine(
+                    "已归因 flow: ${flowCoverage.attributedFlows}" +
+                        formatRate(flowCoverage.attributedFlows, flowCoverage.uniqueFlows),
+                )
+                appendLine("协议分布: ${flowCoverage.protocolSummary()}")
+                appendLine("域名来源: ${flowCoverage.domainSourceSummary()}")
+                appendLine("候选命中: DNS=${flowCoverage.dnsCandidates} TLS=${flowCoverage.tlsCandidates} QUIC=${flowCoverage.quicCandidates} QUIC-Initial=${flowCoverage.quicInitialCandidates}")
+                appendLine("高级识别: DoH=${flowCoverage.dohCandidates} DoT=${flowCoverage.dotCandidates} HTTP/3=${flowCoverage.http3Candidates}")
+                if (flowCoverage.alpnSummary().isNotBlank()) {
+                    appendLine("ALPN Top: ${flowCoverage.alpnSummary()}")
+                }
             }
-            appendLine()
-            appendLine("最近 flow 命中统计:")
-            appendLine("唯一 flow 数: ${flowCoverage.uniqueFlows}")
-            appendLine(
-                "带域名 flow: ${flowCoverage.domainFlows}" +
-                    formatRate(flowCoverage.domainFlows, flowCoverage.uniqueFlows),
-            )
-            appendLine(
-                "已归因 flow: ${flowCoverage.attributedFlows}" +
-                    formatRate(flowCoverage.attributedFlows, flowCoverage.uniqueFlows),
-            )
-            appendLine("协议分布: ${flowCoverage.protocolSummary()}")
-            appendLine("域名来源: ${flowCoverage.domainSourceSummary()}")
-            appendLine("候选命中: DNS=${flowCoverage.dnsCandidates} TLS=${flowCoverage.tlsCandidates} QUIC=${flowCoverage.quicCandidates} QUIC-Initial=${flowCoverage.quicInitialCandidates}")
-            appendLine("高级识别: DoH=${flowCoverage.dohCandidates} DoT=${flowCoverage.dotCandidates} HTTP/3=${flowCoverage.http3Candidates}")
-            if (flowCoverage.alpnSummary().isNotBlank()) {
-                appendLine("ALPN Top: ${flowCoverage.alpnSummary()}")
+
+            runOnUiThread {
+                if (summaryRefreshVersion.get() != refreshVersion) return@runOnUiThread
+                summaryTextView?.text = summaryText
+                updateStatusChip(
+                    if (captureRunning) "监听活跃中"
+                    else if (MonitoringPreferences.mode == MonitoringMode.Forward) "Forward 运行中"
+                    else "等待 Capture 启动",
+                    captureRunning,
+                )
             }
         }
-        updateStatusChip(
-            if (captureRunning) "监听活跃中" else if (MonitoringPreferences.forwardingEnabled) "Forward 运行中" else "等待 Capture 启动",
-            captureRunning,
-        )
     }
 
     private fun refreshTrafficSectionsAsync() {
@@ -733,12 +770,12 @@ class MainActivity : ComponentActivity() {
 
             val domainsText = buildString {
                 if (aggregates.isEmpty()) {
-                    appendLine("当前还没有可展示的聚合对象。")
-                    appendLine("说明：")
-                    appendLine("1. Forward 下目前主要是 forwarding 事件，不是完整 Rust 域名对象流。")
-                    appendLine("2. Capture 下如果命中 DNS 或 TLS SNI，才会把域名写进 objects.jsonl。")
-                    appendLine("3. 现在会按最新对象状态聚合展示域名、目的 IP 和目的端口。")
-                    appendLine("4. URL 统计目前还没接进主链路。")
+                appendLine("当前还没有可展示的聚合对象。")
+                appendLine("说明：")
+                appendLine("1. 只有镜像解析真正收到包后，才会把域名对象写进 objects.jsonl。")
+                appendLine("2. 如果命中 DNS、TLS SNI、QUIC Initial SNI 或 HTTP Host，就会逐步看到域名聚合。")
+                appendLine("3. 现在会按最新对象状态聚合展示域名、目的 IP 和目的端口。")
+                appendLine("4. URL 统计目前还没接进主链路。")
                 } else {
                     appendLine("域名 Top：")
                     appendAggregateSection(this, aggregates.domains)
@@ -1198,7 +1235,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val REFRESH_INTERVAL_MS = 3_000L
-        private const val TAIL_READ_BYTES = 256 * 1024
+        private const val TAIL_READ_BYTES = 96 * 1024
     }
 
     private data class AggregatedObjects(

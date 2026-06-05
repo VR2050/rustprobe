@@ -7,7 +7,8 @@ use rustprobe_attrib::{
     upsert_app_runtime,
 };
 use rustprobe_capture::{
-    is_capture_running, packets_seen, set_output_root, start_capture_from_fd, stop_capture,
+    ingest_mirrored_packet, is_capture_running, packets_seen, set_output_root,
+    start_capture_from_fd, start_mirrored_capture, stop_capture,
 };
 use rustprobe_core::{AppIdentity, AppSelectionMode, FlowKey, FlowOwnerResolution};
 
@@ -31,6 +32,20 @@ pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeStartCapture(
         Ok(started) => as_jboolean(started),
         Err(err) => {
             println!("rustprobe-ffi: failed to start capture: {err}");
+            JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeStartMirroredCapture(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jboolean {
+    match start_mirrored_capture() {
+        Ok(started) => as_jboolean(started),
+        Err(err) => {
+            println!("rustprobe-ffi: failed to start mirrored capture: {err}");
             JNI_FALSE
         }
     }
@@ -267,4 +282,14 @@ pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeQueueOwnerQuery(
             JNI_FALSE
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rustprobe_forward_capture_ingest_packet(data: *const u8, len: usize) {
+    if data.is_null() || len == 0 {
+        return;
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let _ = ingest_mirrored_packet(bytes);
 }

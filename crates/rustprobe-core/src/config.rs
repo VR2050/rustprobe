@@ -3,6 +3,21 @@ use serde::{Deserialize, Serialize};
 use crate::model::AppIdentity;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TrafficDispositionMode {
+    Forward,
+    Capture,
+}
+
+impl TrafficDispositionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Capture => "capture",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AppSelectionMode {
     Global,
     Single(String),
@@ -39,6 +54,7 @@ impl AppSelectionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     pub selection_mode: AppSelectionMode,
+    pub disposition_mode: TrafficDispositionMode,
     pub capture_ipv6: bool,
     pub enable_quic_hints: bool,
     pub emit_object_aggregation: bool,
@@ -48,6 +64,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             selection_mode: AppSelectionMode::Global,
+            disposition_mode: TrafficDispositionMode::Forward,
             capture_ipv6: true,
             enable_quic_hints: true,
             emit_object_aggregation: true,

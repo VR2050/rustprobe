@@ -46,8 +46,6 @@ pub struct FlowActor {
 pub struct FlowIngestResult {
     pub flow: FlowState,
     pub active_flows: usize,
-    pub expired_flows: usize,
-    pub top_objects: Vec<ObjectState>,
     pub touched_objects: Vec<ObjectState>,
 }
 
@@ -186,14 +184,9 @@ impl FlowActor {
                 .and_then(|metadata| metadata.http_host.as_deref()),
             derived_quic_server_name.as_deref(),
         );
-        let expired_flows = self.expire_idle_flows();
-        let top_objects = self.top_objects(4);
-
         Some(FlowIngestResult {
             flow,
             active_flows: self.active_flows(),
-            expired_flows,
-            top_objects,
             touched_objects,
         })
     }
@@ -204,6 +197,10 @@ impl FlowActor {
 
     pub fn active_flows(&self) -> usize {
         self.table.len()
+    }
+
+    pub fn has_flow(&self, key: &FlowKey) -> bool {
+        self.table.contains_key(key)
     }
 
     pub fn snapshot(&self) -> Vec<FlowState> {
@@ -428,7 +425,7 @@ impl FlowActor {
         server_name
     }
 
-    fn top_objects(&self, limit: usize) -> Vec<ObjectState> {
+    pub fn top_objects(&self, limit: usize) -> Vec<ObjectState> {
         let mut values: Vec<_> = self.objects.values().cloned().collect();
         values.sort_by(|left, right| {
             right

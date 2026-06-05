@@ -9,11 +9,18 @@ import android.util.Log
 
 class LocalSocks5Service : Service() {
     companion object {
+        private const val TAG = "LocalSocks5Service"
         const val ACTION_START = "io.rustprobe.app.LOCAL_SOCKS5_START"
         const val ACTION_STOP = "io.rustprobe.app.LOCAL_SOCKS5_STOP"
 
         init {
-            System.loadLibrary("hev-socks5-server")
+            runCatching {
+                System.loadLibrary("hev-socks5-server")
+                Log.i(TAG, "Loaded hev-socks5-server successfully")
+            }.onFailure {
+                Log.e(TAG, "Failed to load hev-socks5-server", it)
+                throw it
+            }
         }
     }
 
@@ -25,13 +32,22 @@ class LocalSocks5Service : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopProxy()
+        Log.i(TAG, "onStartCommand action=${intent?.action} flags=$flags startId=$startId started=$started")
+        return runCatching {
+            if (intent?.action == ACTION_STOP) {
+                stopProxy()
+                val stopped = stopSelfResult(startId)
+                Log.i(TAG, "Processed stop request startId=$startId stopSelfResult=$stopped")
+                START_NOT_STICKY
+            } else {
+                startProxy()
+                START_STICKY
+            }
+        }.getOrElse { error ->
+            Log.e(TAG, "onStartCommand failed", error)
             stopSelf()
-            return START_NOT_STICKY
+            START_NOT_STICKY
         }
-        startProxy()
-        return START_STICKY
     }
 
     override fun onDestroy() {
@@ -42,6 +58,7 @@ class LocalSocks5Service : Service() {
     fun startProxy() {
         if (started) return
 
+        Log.i(TAG, "Preparing local socks5 proxy config")
         val configFile = File(cacheDir, "rustprobe-socks5.conf")
         val outputDir = File(filesDir, "rustprobe-output").apply { mkdirs() }
         val logFile = File(outputDir, "forwarding-socks5.log")
@@ -66,15 +83,17 @@ class LocalSocks5Service : Service() {
             )
         }
 
+        Log.i(TAG, "Starting local socks5 proxy with config=${configFile.absolutePath}")
         Socks5StartService(configFile.absolutePath)
         started = true
-        Log.i("LocalSocks5Service", "local socks5 proxy started on 127.0.0.1:1080")
+        Log.i(TAG, "local socks5 proxy started on 127.0.0.1:1080")
     }
 
     fun stopProxy() {
         if (!started) return
+        Log.i(TAG, "Stopping local socks5 proxy")
         Socks5StopService()
-        Log.i("LocalSocks5Service", "local socks5 proxy stopped")
+        Log.i(TAG, "local socks5 proxy stopped")
         started = false
     }
 }
