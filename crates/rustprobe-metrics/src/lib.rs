@@ -65,13 +65,9 @@ impl BucketStats {
             .entry(observation.dst_port.to_string())
             .or_default()
             .observe(observation.bytes, observation.packets);
-        if let Some(domain) = observation
-            .domain
-            .as_ref()
-            .filter(|value| !value.is_empty())
-        {
+        if let Some(domain) = canonicalize_domain(observation.domain.as_deref()) {
             self.domains
-                .entry(domain.to_lowercase())
+                .entry(domain)
                 .or_default()
                 .observe(observation.bytes, observation.packets);
         }
@@ -251,7 +247,7 @@ impl AppTrafficAnalyticsActor {
             app: app.clone(),
             total_bytes: aggregate.total_bytes,
             total_packets: aggregate.total_packets,
-            active_flows: count_active_flows(scope, active_flows),
+            active_flows: count_active_flows(scope, active_flows, window_start),
             protocol_distribution: top_ranked_metrics(aggregate.protocols),
             top_ips: top_ranked_metrics(aggregate.ips),
             top_domains: top_ranked_metrics(aggregate.domains),
@@ -338,17 +334,28 @@ fn display_scope(scope: &str, app: Option<&AppIdentity>) -> String {
     }
 }
 
-fn count_active_flows(scope: &str, flows: &[FlowState]) -> usize {
+fn canonicalize_domain(domain: Option<&str>) -> Option<String> {
+    domain
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn count_active_flows(scope: &str, flows: &[FlowState], window_start: u128) -> usize {
     flows
         .iter()
-        .filter(|flow| match scope {
-            OVERALL_SCOPE => true,
-            UNATTRIBUTED_SCOPE => flow.app.is_none(),
-            package_name => flow
-                .app
-                .as_ref()
-                .map(|app| app.package_name.as_str() == package_name)
-                .unwrap_or(false),
+        .filter(|flow| flow.last_seen_unix_ms >= window_start)
+        .filter(|flow| {
+            match scope {
+                OVERALL_SCOPE => true,
+                UNATTRIBUTED_SCOPE => flow.app.is_none(),
+                package_name => flow
+                    .app
+                    .as_ref()
+                    .map(|app| app.package_name.as_str() == package_name)
+                    .unwrap_or(false),
+            }
         })
         .count()
 }
@@ -383,7 +390,7 @@ mod tests {
             app: Some(app.clone()),
             protocol: ProtocolHint::Tls,
             dst_addr: "1.1.1.1".into(),
-            domain: Some("example.com".into()),
+            domain: Some("Example.com.".into()),
             dst_port: 443,
             bytes: 800,
             packets: 1,
@@ -409,5 +416,56 @@ mod tests {
         assert_eq!(snapshot.apps[0].top_domains[0].label, "example.com");
         assert_eq!(snapshot.apps[0].top_ports[0].label, "443");
         assert_eq!(snapshot.apps[0].protocol_distribution[0].label, "TLS");
+    }
+
+    #[test]
+    fn active_flows_respect_snapshot_window() {
+        let mut actor = AppTrafficAnalyticsActor::new(10_000, 3);
+        let base = now_unix_ms();
+        let app = AppIdentity {
+            uid: 1002,
+            package_name: "com.example.window".into(),
+            app_label: "Window".into(),
+        };
+
+        actor.observe(TrafficObservation {
+            observed_at_unix_ms: base,
+            app: Some(app.clone()),
+            protocol: ProtocolHint::Http,
+            dst_addr: "2.2.2.2".into(),
+            domain: Some("window.example".into()),
+            dst_port: 80,
+            bytes: 640,
+            packets: 1,
+        });
+
+        let mut fresh = FlowState::new(
+            FlowKey {
+                src_addr: "10.0.0.2".into(),
+                dst_addr: "2.2.2.2".into(),
+                src_port: 40000,
+                dst_port: 80,
+                protocol: ProtocolHint::Tcp,
+            },
+            640,
+        );
+        fresh.last_seen_unix_ms = base;
+        fresh.set_app(Some(app.clone()));
+
+        let mut stale = FlowState::new(
+            FlowKey {
+                src_addr: "10.0.0.2".into(),
+                dst_addr: "3.3.3.3".into(),
+                src_port: 40001,
+                dst_port: 443,
+                protocol: ProtocolHint::Tcp,
+            },
+            1024,
+        );
+        stale.last_seen_unix_ms = base.saturating_sub(60_000);
+        stale.set_app(Some(app));
+
+        let snapshot = actor.snapshot(&[fresh, stale]);
+        assert_eq!(snapshot.apps[0].active_flows, 1);
     }
 }

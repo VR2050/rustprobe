@@ -287,7 +287,7 @@ impl CaptureRuntime {
                     dst_addr: flow.flow.key.dst_addr.clone(),
                     domain: flow.flow.domain.clone(),
                     dst_port,
-                    bytes: parsed.payload_len as u64,
+                    bytes: size as u64,
                     packets: 1,
                 });
             }

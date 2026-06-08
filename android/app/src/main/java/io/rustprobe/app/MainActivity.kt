@@ -4,17 +4,31 @@ import android.app.Activity
 import android.app.ActivityManager
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.TrafficStats
 import android.net.VpnService
+import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.os.StatFs
+import android.os.SystemClock
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -37,6 +51,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.math.max
@@ -107,6 +122,18 @@ class MainActivity : ComponentActivity() {
     private var packetsMetricValueTextView: TextView? = null
     private var flowsMetricValueTextView: TextView? = null
     private var appsMetricValueTextView: TextView? = null
+    private var memoryMetricValueTextView: TextView? = null
+    private var overviewMemoryGaugeView: GaugeView? = null
+    private var overviewTemperatureGaugeView: GaugeView? = null
+    private var overviewPowerGaugeView: GaugeView? = null
+    private var overviewSpeedChartView: MiniLineChartView? = null
+    private var overviewMemoryDetailTextView: TextView? = null
+    private var overviewTemperatureDetailTextView: TextView? = null
+    private var overviewSpeedDetailTextView: TextView? = null
+    private var overviewPowerDetailTextView: TextView? = null
+    private var overviewStorageDetailTextView: TextView? = null
+    private var overviewNetworkDetailTextView: TextView? = null
+    private var overviewSensorLogTextView: TextView? = null
     private var overviewScreen: View? = null
     private var monitorScreen: View? = null
     private var analysisScreen: View? = null
@@ -123,6 +150,15 @@ class MainActivity : ComponentActivity() {
     private var appsTabButton: Button? = null
     private var latestAnalyticsSnapshot: JSONObject? = null
     private var selectedAnalyticsScope: String? = null
+    private val sensorLogLines = ArrayDeque<String>()
+    private val speedHistory = ArrayDeque<Long>()
+    private val sensorLastLogAt = linkedMapOf<Int, Long>()
+    private var sensorManager: SensorManager? = null
+    private var sensorEventListener: SensorEventListener? = null
+    private var trafficSampleAtMs: Long = 0L
+    private var trafficSampleRxBytes: Long = 0L
+    private var trafficSampleTxBytes: Long = 0L
+    private var lastSmoothedSpeedBytesPerSecond: Double = 0.0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -134,6 +170,7 @@ class MainActivity : ComponentActivity() {
         installedApps = AppInventory.listInstalledApps(this)
             .filterNot { it.packageName == packageName }
         syncAppsIntoRust(installedApps)
+        setupSensorMonitoring()
 
         restoreStateFromPreferences()
         setContentView(buildContentView())
@@ -148,10 +185,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        registerSensorListeners()
         evaluateAutoRefresh()
     }
 
     override fun onPause() {
+        unregisterSensorListeners()
         stopAutoRefresh()
         super.onPause()
     }
@@ -174,7 +213,13 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(heroCard, cardParams(bottom = 12))
 
-        val metricsRow = LinearLayout(this).apply {
+        val metricsColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val metricsRowTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val metricsRowBottom = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
         val modeMetric = metricCard("模式")
@@ -185,11 +230,16 @@ class MainActivity : ComponentActivity() {
         flowsMetricValueTextView = flowMetric.second
         val appMetric = metricCard("应用")
         appsMetricValueTextView = appMetric.second
-        metricsRow.addView(modeMetric.first, weightedCardParams())
-        metricsRow.addView(packetMetric.first, weightedCardParams(start = 8))
-        metricsRow.addView(flowMetric.first, weightedCardParams(start = 8))
-        metricsRow.addView(appMetric.first, weightedCardParams(start = 8))
-        root.addView(metricsRow, cardParams(bottom = 12))
+        val memoryMetric = metricCard("内存")
+        memoryMetricValueTextView = memoryMetric.second
+        metricsRowTop.addView(modeMetric.first, weightedCardParams())
+        metricsRowTop.addView(packetMetric.first, weightedCardParams(start = 8))
+        metricsRowTop.addView(flowMetric.first, weightedCardParams(start = 8))
+        metricsRowBottom.addView(appMetric.first, weightedCardParams())
+        metricsRowBottom.addView(memoryMetric.first, weightedCardParams(start = 8))
+        metricsColumn.addView(metricsRowTop)
+        metricsColumn.addView(metricsRowBottom, cardParams(bottom = 0).apply { topMargin = dp(8) })
+        root.addView(metricsColumn, cardParams(bottom = 12))
 
         val navBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -244,12 +294,65 @@ class MainActivity : ComponentActivity() {
             ),
         )
 
+        val dialRowTop = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val dialRowBottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val memoryGaugeCard = buildGaugeCard(
+            title = "表盘一 / 内存占用率",
+            accent = "#3DD9FF",
+            thresholdPercent = 82f,
+        )
+        overviewMemoryGaugeView = memoryGaugeCard.gauge
+        overviewMemoryDetailTextView = memoryGaugeCard.detail
+        dialRowTop.addView(memoryGaugeCard.card, weightedCardParams())
+
+        val temperatureGaugeCard = buildGaugeCard(
+            title = "表盘二 / 当前热度",
+            accent = "#FF8A3D",
+            thresholdPercent = 84f,
+        )
+        overviewTemperatureGaugeView = temperatureGaugeCard.gauge
+        overviewTemperatureDetailTextView = temperatureGaugeCard.detail
+        dialRowTop.addView(temperatureGaugeCard.card, weightedCardParams(start = 8))
+
+        val waveCard = buildWaveCard("表盘三 / 实时网速")
+        overviewSpeedChartView = waveCard.chart
+        overviewSpeedDetailTextView = waveCard.detail
+        dialRowBottom.addView(waveCard.card, weightedCardParams())
+
+        val powerGaugeCard = buildGaugeCard(
+            title = "表盘四 / 动力输出",
+            accent = "#2FE6C6",
+            thresholdPercent = 78f,
+        )
+        overviewPowerGaugeView = powerGaugeCard.gauge
+        overviewPowerDetailTextView = powerGaugeCard.detail
+        dialRowBottom.addView(powerGaugeCard.card, weightedCardParams(start = 8))
+        column.addView(dialRowTop, cardParams(bottom = 12))
+        column.addView(dialRowBottom, cardParams(bottom = 12))
+
+        val systemCard = cardLayout(fill = "#0F151E", stroke = "#223243").apply {
+            addView(sectionTitleDark("系统态监控"))
+            overviewStorageDetailTextView = bodyViewDark("正在采样存储占用...")
+            addView(overviewStorageDetailTextView)
+            overviewNetworkDetailTextView = bodyViewDark("正在采样网络质量与信号...")
+            addView(overviewNetworkDetailTextView)
+        }
+        column.addView(systemCard, cardParams(bottom = 12))
+
         val overviewSummaryCard = cardLayout(fill = "#0F151E", stroke = "#223243").apply {
             addView(sectionTitleDark("运行总览"))
             summaryTextView = monoBlockDark("正在生成运行摘要...")
             addView(summaryTextView)
         }
         column.addView(overviewSummaryCard, cardParams(bottom = 12))
+
+        val sensorCard = cardLayout(fill = "#101821", stroke = "#223243").apply {
+            addView(sectionTitleDark("底部滚动日志 / 实时传感器"))
+            addView(bodyViewDark("陀螺仪、气压、光强会持续滚动刷新。没有对应硬件时会明确标出来。"))
+            overviewSensorLogTextView = monoBlockDark("等待传感器数据...")
+            addView(panelScroll(overviewSensorLogTextView!!))
+        }
+        column.addView(sensorCard, cardParams(bottom = 12))
 
         val overviewGuideCard = cardLayout(fill = "#101821", stroke = "#223243").apply {
             addView(sectionTitleDark("导航提示"))
@@ -258,6 +361,119 @@ class MainActivity : ComponentActivity() {
         }
         column.addView(overviewGuideCard)
         return scroll
+    }
+
+    private fun buildGaugeCard(
+        title: String,
+        accent: String,
+        thresholdPercent: Float,
+    ): GaugeCardBinding {
+        val detail = bodyViewDark("等待数据...")
+        val gauge = GaugeView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(150),
+            ).apply { bottomMargin = dp(10) }
+            setAccentColor(accent)
+            setThresholdPercent(thresholdPercent)
+        }
+        val card = cardLayout(fill = "#0F151E", stroke = "#223243").apply {
+            addView(sectionTitleDark(title))
+            addView(gauge)
+            addView(detail)
+        }
+        return GaugeCardBinding(card, gauge, detail)
+    }
+
+    private fun buildWaveCard(title: String): WaveCardBinding {
+        val detail = bodyViewDark("等待网速采样...")
+        val chart = MiniLineChartView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(150),
+            ).apply { bottomMargin = dp(10) }
+        }
+        val card = cardLayout(fill = "#0F151E", stroke = "#223243").apply {
+            addView(sectionTitleDark(title))
+            addView(chart)
+            addView(detail)
+        }
+        return WaveCardBinding(card, chart, detail)
+    }
+
+    private fun setupSensorMonitoring() {
+        sensorManager = getSystemService(SensorManager::class.java)
+        sensorEventListener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                val sensor = event.sensor ?: return
+                val now = SystemClock.elapsedRealtime()
+                val last = sensorLastLogAt[sensor.type] ?: 0L
+                if (now - last < 900L) return
+                sensorLastLogAt[sensor.type] = now
+                val line = when (sensor.type) {
+                    Sensor.TYPE_GYROSCOPE -> {
+                        "gyro ${formatClockTime(now)}  x=${event.values.getOrNull(0)?.let { String.format("%.2f", it) }}  y=${event.values.getOrNull(1)?.let { String.format("%.2f", it) }}  z=${event.values.getOrNull(2)?.let { String.format("%.2f", it) }}"
+                    }
+                    Sensor.TYPE_PRESSURE -> {
+                        "baro ${formatClockTime(now)}  ${event.values.getOrNull(0)?.let { String.format("%.1f hPa", it) }}"
+                    }
+                    Sensor.TYPE_LIGHT -> {
+                        "light ${formatClockTime(now)}  ${event.values.getOrNull(0)?.let { String.format("%.1f lx", it) }}"
+                    }
+                    else -> return
+                }
+                appendSensorLog(line)
+            }
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+        }
+
+        appendSensorLog(
+            buildString {
+                append("sensors armed  ")
+                append(sensorAvailability("gyro", Sensor.TYPE_GYROSCOPE))
+                append("  ")
+                append(sensorAvailability("baro", Sensor.TYPE_PRESSURE))
+                append("  ")
+                append(sensorAvailability("light", Sensor.TYPE_LIGHT))
+            },
+        )
+    }
+
+    private fun registerSensorListeners() {
+        val manager = sensorManager ?: return
+        val listener = sensorEventListener ?: return
+        listOf(
+            Sensor.TYPE_GYROSCOPE,
+            Sensor.TYPE_PRESSURE,
+            Sensor.TYPE_LIGHT,
+        ).forEach { type ->
+            manager.getDefaultSensor(type)?.let { sensor ->
+                manager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+            }
+        }
+    }
+
+    private fun unregisterSensorListeners() {
+        val manager = sensorManager ?: return
+        val listener = sensorEventListener ?: return
+        manager.unregisterListener(listener)
+    }
+
+    private fun appendSensorLog(line: String) {
+        if (sensorLogLines.size >= 24) {
+            sensorLogLines.removeFirst()
+        }
+        sensorLogLines.addLast(line)
+        overviewSensorLogTextView?.text = sensorLogLines.joinToString("\n")
+    }
+
+    private fun sensorAvailability(label: String, type: Int): String {
+        return if (sensorManager?.getDefaultSensor(type) != null) {
+            "$label=online"
+        } else {
+            "$label=na"
+        }
     }
 
     private fun buildMonitorScreen(): View {
@@ -976,6 +1192,8 @@ class MainActivity : ComponentActivity() {
             val captureRunning = runCatching { RustBridge.nativeIsCaptureRunning() }.getOrDefault(false)
             val selectionSummary = runCatching { RustBridge.nativeSelectionSummary() }.getOrDefault("unavailable")
             val attribution = runCatching { RustBridge.attributionStats() }.getOrNull()
+            val systemMemory = captureSystemMemorySnapshot()
+            val systemDashboard = captureSystemDashboardSnapshot(systemMemory)
             val outputDir = File(filesDir, "rustprobe-output")
             val flowCoverage = computeFlowCoverageStats(
                 readLastJsonObjects(File(outputDir, "flows.jsonl"), limit = 160),
@@ -992,6 +1210,14 @@ class MainActivity : ComponentActivity() {
                         "共享解析链运行中（Capture 默认抓取）: $captureRunning"
                     },
                 )
+                appendLine("系统内存占用: ${systemMemory.summaryLine()}")
+                appendLine("系统内存详情: used=${formatBytes(systemMemory.usedBytes)} / total=${formatBytes(systemMemory.totalBytes)} / avail=${formatBytes(systemMemory.availableBytes)}")
+                appendLine("系统内存阈值: ${formatBytes(systemMemory.thresholdBytes)}  lowMemory=${if (systemMemory.lowMemory) "yes" else "no"}")
+                appendLine("电池热度: ${systemDashboard.temperatureSummary}")
+                appendLine("动力输出: ${systemDashboard.powerSummary}")
+                appendLine("实时网速: ${systemDashboard.speedSummary}")
+                appendLine("存储占用: ${systemDashboard.storageSummary}")
+                appendLine("网络质量: ${systemDashboard.networkSummary}")
                 appendLine("已见数据包数: $packetsSeen")
                 appendLine("当前选择: $selectionSummary")
                 appendLine("输出目录: ${outputDir.absolutePath}")
@@ -1040,6 +1266,8 @@ class MainActivity : ComponentActivity() {
                 packetsMetricValueTextView?.text = compactCount(packetsSeen.toLong())
                 flowsMetricValueTextView?.text = compactCount(flowCoverage.uniqueFlows.toLong())
                 appsMetricValueTextView?.text = compactCount((attribution?.trackedApps ?: 0).toLong())
+                memoryMetricValueTextView?.text = systemMemory.metricLabel()
+                updateOverviewDashboard(systemDashboard)
                 updateStatusChip(
                     if (captureRunning) "监听活跃中"
                     else if (MonitoringPreferences.mode == MonitoringMode.Forward) "Forward 运行中"
@@ -1993,6 +2221,188 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun captureSystemMemorySnapshot(): SystemMemorySnapshot {
+        val activityManager = getSystemService(ActivityManager::class.java)
+        val memoryInfo = ActivityManager.MemoryInfo()
+        activityManager?.getMemoryInfo(memoryInfo)
+        val totalBytes = memoryInfo.totalMem.coerceAtLeast(0L)
+        val availableBytes = memoryInfo.availMem.coerceAtLeast(0L)
+        val usedBytes = (totalBytes - availableBytes).coerceAtLeast(0L)
+        val usedPercent = if (totalBytes > 0L) {
+            (usedBytes * 100.0) / totalBytes.toDouble()
+        } else {
+            0.0
+        }
+        return SystemMemorySnapshot(
+            totalBytes = totalBytes,
+            availableBytes = availableBytes,
+            usedBytes = usedBytes,
+            thresholdBytes = memoryInfo.threshold.coerceAtLeast(0L),
+            lowMemory = memoryInfo.lowMemory,
+            usedPercent = usedPercent,
+        )
+    }
+
+    private fun captureSystemDashboardSnapshot(memory: SystemMemorySnapshot): SystemDashboardSnapshot {
+        val batteryIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val batteryManager = getSystemService(BatteryManager::class.java)
+        val rawTemp = batteryIntent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE
+        val temperatureC = if (rawTemp != Int.MIN_VALUE) rawTemp / 10f else null
+        val rawLevel = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val rawScale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val batteryLevelPercent = if (rawLevel >= 0 && rawScale > 0) {
+            (rawLevel * 100f) / rawScale.toFloat()
+        } else {
+            null
+        }
+        val batteryStatus = batteryIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val batteryPlugged = batteryIntent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+        val batteryHealth = batteryIntent?.getIntExtra(BatteryManager.EXTRA_HEALTH, -1) ?: -1
+        val currentUa = batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+            ?.takeIf { it != Int.MIN_VALUE }
+        val statFs = StatFs(Environment.getDataDirectory().absolutePath)
+        val storageTotal = statFs.totalBytes.coerceAtLeast(0L)
+        val storageAvailable = statFs.availableBytes.coerceAtLeast(0L)
+        val storageUsed = (storageTotal - storageAvailable).coerceAtLeast(0L)
+        val storageUsedPercent = if (storageTotal > 0L) {
+            (storageUsed * 100.0) / storageTotal.toDouble()
+        } else {
+            0.0
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        val rx = TrafficStats.getTotalRxBytes().coerceAtLeast(0L)
+        val tx = TrafficStats.getTotalTxBytes().coerceAtLeast(0L)
+        val elapsedMs = (now - trafficSampleAtMs).coerceAtLeast(1L)
+        val rxBps = if (trafficSampleAtMs > 0L && now > trafficSampleAtMs) {
+            (((rx - trafficSampleRxBytes).coerceAtLeast(0L)) * 1000.0 / elapsedMs.toDouble()).toLong()
+        } else {
+            0L
+        }
+        val txBps = if (trafficSampleAtMs > 0L && now > trafficSampleAtMs) {
+            (((tx - trafficSampleTxBytes).coerceAtLeast(0L)) * 1000.0 / elapsedMs.toDouble()).toLong()
+        } else {
+            0L
+        }
+        val instantTotalBps = rxBps + txBps
+        val smoothedTotalBps = if (trafficSampleAtMs > 0L) {
+            ((lastSmoothedSpeedBytesPerSecond * 0.62) + (instantTotalBps * 0.38)).toLong()
+        } else {
+            instantTotalBps
+        }
+        lastSmoothedSpeedBytesPerSecond = smoothedTotalBps.toDouble()
+        trafficSampleAtMs = now
+        trafficSampleRxBytes = rx
+        trafficSampleTxBytes = tx
+        if (speedHistory.size >= 24) {
+            speedHistory.removeFirst()
+        }
+        speedHistory.addLast(smoothedTotalBps)
+
+        val connectivityManager = getSystemService(ConnectivityManager::class.java)
+        val capabilities = connectivityManager?.getNetworkCapabilities(connectivityManager.activeNetwork)
+        val wifiManager = applicationContext.getSystemService(WifiManager::class.java)
+        val powerManager = getSystemService(PowerManager::class.java)
+        val transportLabel = when {
+            capabilities == null -> "offline"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Cellular"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+            else -> "Other"
+        }
+        val signalSummary = if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+            @Suppress("DEPRECATION")
+            val rssi = runCatching { wifiManager?.connectionInfo?.rssi }.getOrNull()
+            if (rssi != null && rssi > -127) {
+                val level = wifiSignalLevel(rssi)
+                "RSSI ${rssi}dBm  L$level/5"
+            } else {
+                "Wi-Fi signal unavailable"
+            }
+        } else {
+            val down = capabilities?.linkDownstreamBandwidthKbps ?: 0
+            val up = capabilities?.linkUpstreamBandwidthKbps ?: 0
+            if (down > 0 || up > 0) "bw ${down}↓/${up}↑ kbps" else "signal unavailable"
+        }
+        val currentAverageUa = batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE)
+            ?.takeIf { it != Int.MIN_VALUE }
+        val signedCurrentMa = (currentAverageUa ?: currentUa)?.let { it / 1000f }
+        val isDischarging = signedCurrentMa?.let { it < 0f }
+        val thermalStatus = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            powerManager?.currentThermalStatus ?: PowerManager.THERMAL_STATUS_NONE
+        } else {
+            PowerManager.THERMAL_STATUS_NONE
+        }
+        val networkFlags = buildList {
+            if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) add("validated")
+            if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true) add("unmetered")
+            if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_CONGESTED) == true) add("not-congested")
+        }
+        val validated = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        val wifiSignalLevel = if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+            @Suppress("DEPRECATION")
+            runCatching { wifiManager?.connectionInfo?.rssi }.getOrNull()?.takeIf { it > -127 }?.let { wifiSignalLevel(it) }
+        } else {
+            null
+        }
+        val qualityLabel = determineNetworkQuality(
+            smoothedTotalBps = smoothedTotalBps,
+            validated = validated,
+            wifiLevel = wifiSignalLevel,
+            capabilities = capabilities,
+        )
+
+        return SystemDashboardSnapshot(
+            memory = memory,
+            batteryLevelPercent = batteryLevelPercent,
+            temperatureC = temperatureC,
+            currentMa = signedCurrentMa?.let { kotlin.math.abs(it) },
+            isDischarging = isDischarging,
+            batteryStatus = batteryStatusLabel(batteryStatus, batteryPlugged),
+            batteryHealth = batteryHealthLabel(batteryHealth),
+            thermalStatus = thermalStatusLabel(thermalStatus),
+            storageUsedBytes = storageUsed,
+            storageTotalBytes = storageTotal,
+            storageUsedPercent = storageUsedPercent,
+            totalBytesPerSecond = smoothedTotalBps,
+            instantaneousBytesPerSecond = instantTotalBps,
+            rxBytesPerSecond = rxBps,
+            txBytesPerSecond = txBps,
+            trafficHistory = speedHistory.toList(),
+            transportLabel = transportLabel,
+            signalSummary = listOf(signalSummary, networkFlags.joinToString(" ")).filter { it.isNotBlank() }.joinToString("  "),
+            qualityLabel = qualityLabel,
+        )
+    }
+
+    private fun updateOverviewDashboard(snapshot: SystemDashboardSnapshot) {
+        overviewMemoryGaugeView?.submit(snapshot.memory.usedPercent.toFloat(), snapshot.memory.metricLabel(), "RAM")
+        overviewMemoryDetailTextView?.text = "used ${formatBytes(snapshot.memory.usedBytes)} / total ${formatBytes(snapshot.memory.totalBytes)}"
+
+        val tempPercent = ((snapshot.temperatureC ?: 0f) / 50f * 100f).coerceIn(0f, 100f)
+        overviewTemperatureGaugeView?.submit(
+            tempPercent,
+            snapshot.temperatureC?.let { String.format("%.1fC", it) } ?: "--",
+            "TEMP",
+        )
+        overviewTemperatureDetailTextView?.text = snapshot.temperatureSummary
+
+        overviewSpeedChartView?.submit(snapshot.trafficHistory)
+        overviewSpeedDetailTextView?.text = snapshot.speedSummary
+
+        val currentPercent = (((snapshot.currentMa ?: 0f) / 2500f) * 100f).coerceIn(0f, 100f)
+        overviewPowerGaugeView?.submit(
+            currentPercent,
+            snapshot.currentMa?.let { String.format("%.0fmA", it) } ?: "--",
+            "PWR",
+        )
+        overviewPowerDetailTextView?.text = snapshot.powerSummary
+
+        overviewStorageDetailTextView?.text = snapshot.storageSummary
+        overviewNetworkDetailTextView?.text = snapshot.networkSummary
+    }
+
     private fun compactCount(value: Long): String {
         return when {
             value >= 1_000_000L -> String.format("%.1fM", value / 1_000_000.0)
@@ -2007,6 +2417,102 @@ class MainActivity : ComponentActivity() {
         val minutes = (totalSeconds / 60L) % 60L
         val seconds = totalSeconds % 60L
         return String.format("%02d:%02d:%02d", hours, minutes, seconds)
+    }
+
+    private fun formatClockTime(elapsedRealtimeMs: Long): String {
+        val totalSeconds = elapsedRealtimeMs / 1000L
+        val minutes = (totalSeconds / 60L) % 60L
+        val seconds = totalSeconds % 60L
+        return String.format("%02d:%02d", minutes, seconds)
+    }
+
+    private fun wifiSignalLevel(rssi: Int): Int {
+        return when {
+            rssi >= -55 -> 5
+            rssi >= -62 -> 4
+            rssi >= -69 -> 3
+            rssi >= -76 -> 2
+            else -> 1
+        }
+    }
+
+    private fun determineNetworkQuality(
+        smoothedTotalBps: Long,
+        validated: Boolean,
+        wifiLevel: Int?,
+        capabilities: NetworkCapabilities?,
+    ): String {
+        val throughputTier = when {
+            smoothedTotalBps >= 8L * 1024 * 1024 -> 4
+            smoothedTotalBps >= 2L * 1024 * 1024 -> 3
+            smoothedTotalBps >= 512L * 1024 -> 2
+            smoothedTotalBps > 0L -> 1
+            else -> 0
+        }
+        val signalTier = when {
+            wifiLevel != null -> wifiLevel - 1
+            capabilities?.linkDownstreamBandwidthKbps ?: 0 >= 20_000 -> 4
+            capabilities?.linkDownstreamBandwidthKbps ?: 0 >= 5_000 -> 3
+            capabilities?.linkDownstreamBandwidthKbps ?: 0 >= 1_000 -> 2
+            capabilities?.linkDownstreamBandwidthKbps ?: 0 > 0 -> 1
+            else -> 0
+        }
+        val effectiveTier = if (wifiLevel != null || (capabilities?.linkDownstreamBandwidthKbps ?: 0) > 0) {
+            minOf(throughputTier, signalTier)
+        } else {
+            throughputTier
+        }
+        return when {
+            !validated && effectiveTier <= 1 -> "unstable"
+            effectiveTier >= 4 && validated -> "excellent"
+            effectiveTier >= 3 && validated -> "strong"
+            effectiveTier >= 2 -> "steady"
+            effectiveTier >= 1 -> "light"
+            else -> "idle"
+        }
+    }
+
+    private fun batteryStatusLabel(status: Int, plugged: Int): String {
+        val base = when (status) {
+            BatteryManager.BATTERY_STATUS_CHARGING -> "charging"
+            BatteryManager.BATTERY_STATUS_DISCHARGING -> "discharging"
+            BatteryManager.BATTERY_STATUS_FULL -> "full"
+            BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "idle"
+            else -> "unknown"
+        }
+        val source = when (plugged) {
+            BatteryManager.BATTERY_PLUGGED_USB -> "usb"
+            BatteryManager.BATTERY_PLUGGED_AC -> "ac"
+            BatteryManager.BATTERY_PLUGGED_WIRELESS -> "wireless"
+            BatteryManager.BATTERY_PLUGGED_DOCK -> "dock"
+            else -> ""
+        }
+        return listOf(base, source).filter { it.isNotBlank() }.joinToString(" ")
+    }
+
+    private fun batteryHealthLabel(health: Int): String {
+        return when (health) {
+            BatteryManager.BATTERY_HEALTH_GOOD -> "good"
+            BatteryManager.BATTERY_HEALTH_OVERHEAT -> "overheat"
+            BatteryManager.BATTERY_HEALTH_DEAD -> "dead"
+            BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> "over-voltage"
+            BatteryManager.BATTERY_HEALTH_UNSPECIFIED_FAILURE -> "failure"
+            BatteryManager.BATTERY_HEALTH_COLD -> "cold"
+            else -> "unknown"
+        }
+    }
+
+    private fun thermalStatusLabel(status: Int): String {
+        return when (status) {
+            PowerManager.THERMAL_STATUS_NONE -> "nominal"
+            PowerManager.THERMAL_STATUS_LIGHT -> "light"
+            PowerManager.THERMAL_STATUS_MODERATE -> "moderate"
+            PowerManager.THERMAL_STATUS_SEVERE -> "severe"
+            PowerManager.THERMAL_STATUS_CRITICAL -> "critical"
+            PowerManager.THERMAL_STATUS_EMERGENCY -> "emergency"
+            PowerManager.THERMAL_STATUS_SHUTDOWN -> "shutdown-risk"
+            else -> "unknown"
+        }
     }
 
     private fun appendAggregateSection(builder: StringBuilder, entries: List<AggregateEntry>) {
@@ -2215,6 +2721,100 @@ class MainActivity : ComponentActivity() {
         val packets: Long,
     )
 
+    private data class GaugeCardBinding(
+        val card: View,
+        val gauge: GaugeView,
+        val detail: TextView,
+    )
+
+    private data class WaveCardBinding(
+        val card: View,
+        val chart: MiniLineChartView,
+        val detail: TextView,
+    )
+
+    private data class SystemMemorySnapshot(
+        val totalBytes: Long,
+        val availableBytes: Long,
+        val usedBytes: Long,
+        val thresholdBytes: Long,
+        val lowMemory: Boolean,
+        val usedPercent: Double,
+    ) {
+        fun metricLabel(): String {
+            return "${String.format("%.0f", usedPercent)}%"
+        }
+
+        fun summaryLine(): String {
+            return "${formatStaticBytes(usedBytes)} / ${formatStaticBytes(totalBytes)} (${String.format("%.1f", usedPercent)}%)"
+        }
+    }
+
+    private data class SystemDashboardSnapshot(
+        val memory: SystemMemorySnapshot,
+        val batteryLevelPercent: Float?,
+        val temperatureC: Float?,
+        val currentMa: Float?,
+        val isDischarging: Boolean?,
+        val batteryStatus: String,
+        val batteryHealth: String,
+        val thermalStatus: String,
+        val storageUsedBytes: Long,
+        val storageTotalBytes: Long,
+        val storageUsedPercent: Double,
+        val totalBytesPerSecond: Long,
+        val instantaneousBytesPerSecond: Long,
+        val rxBytesPerSecond: Long,
+        val txBytesPerSecond: Long,
+        val trafficHistory: List<Long>,
+        val transportLabel: String,
+        val signalSummary: String,
+        val qualityLabel: String,
+    ) {
+        val temperatureSummary: String
+            get() = buildString {
+                append(
+                    temperatureC?.let { String.format("%.1f C", it) } ?: "temperature unavailable",
+                )
+                batteryLevelPercent?.let {
+                    append("  battery ")
+                    append(String.format("%.0f%%", it))
+                }
+                append("  thermal ")
+                append(thermalStatus)
+                if ((temperatureC ?: 0f) >= 42f) {
+                    append("  warning>42C")
+                }
+            }
+
+        val powerSummary: String
+            get() = currentMa?.let {
+                buildString {
+                    append(String.format("%.0f mA", it))
+                    append("  ")
+                    append(
+                        when (isDischarging) {
+                            true -> "discharging"
+                            false -> "charging"
+                            null -> batteryStatus
+                        },
+                    )
+                    append("  health=")
+                    append(batteryHealth)
+                }
+            }
+                ?: "current unavailable  status=$batteryStatus  health=$batteryHealth"
+
+        val speedSummary: String
+            get() = "${formatStaticBytes(totalBytesPerSecond)}/s  rx=${formatStaticBytes(rxBytesPerSecond)}/s  tx=${formatStaticBytes(txBytesPerSecond)}/s  instant=${formatStaticBytes(instantaneousBytesPerSecond)}/s  quality=$qualityLabel"
+
+        val storageSummary: String
+            get() = "storage ${formatStaticBytes(storageUsedBytes)} / ${formatStaticBytes(storageTotalBytes)} (${String.format("%.1f", storageUsedPercent)}%)"
+
+        val networkSummary: String
+            get() = "$transportLabel  $signalSummary"
+    }
+
     private data class RankedMetric(
         val label: String,
         val bytes: Long,
@@ -2394,5 +2994,98 @@ private class MiniLineChartView(context: android.content.Context) : View(context
         val lastX = left + (stepX * (points.size - 1))
         val lastY = bottom - ((points.last().toFloat() / maxValue) * innerHeight)
         canvas.drawCircle(lastX, lastY, 7f, pointPaint)
+    }
+}
+
+private class GaugeView(context: android.content.Context) : View(context) {
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#18232E")
+        style = Paint.Style.STROKE
+        strokeWidth = 18f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val valuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#3DD9FF")
+        style = Paint.Style.STROKE
+        strokeWidth = 20f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val thresholdPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#FF5E5E")
+        style = Paint.Style.STROKE
+        strokeWidth = 6f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#E7F8FF")
+        textAlign = Paint.Align.CENTER
+        textSize = 42f
+        typeface = Typeface.create("monospace", Typeface.BOLD)
+    }
+    private val subLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#88A6BB")
+        textAlign = Paint.Align.CENTER
+        textSize = 26f
+        typeface = Typeface.MONOSPACE
+    }
+
+    private var percent: Float = 0f
+    private var valueText: String = "--"
+    private var label: String = "--"
+    private var thresholdPercent: Float = 80f
+
+    fun submit(percent: Float, valueText: String, label: String) {
+        this.percent = percent.coerceIn(0f, 100f)
+        this.valueText = valueText
+        this.label = label
+        invalidate()
+    }
+
+    fun setAccentColor(color: String) {
+        valuePaint.color = Color.parseColor(color)
+    }
+
+    fun setThresholdPercent(percent: Float) {
+        thresholdPercent = percent.coerceIn(0f, 100f)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+
+        val pad = 28f
+        val arcLeft = pad
+        val arcTop = pad
+        val arcRight = w - pad
+        val arcBottom = h - pad
+        val startAngle = 150f
+        val sweepAngle = 240f
+        canvas.drawArc(arcLeft, arcTop, arcRight, arcBottom, startAngle, sweepAngle, false, trackPaint)
+        canvas.drawArc(arcLeft, arcTop, arcRight, arcBottom, startAngle, sweepAngle * (percent / 100f), false, valuePaint)
+
+        val thresholdAngle = Math.toRadians((startAngle + sweepAngle * (thresholdPercent / 100f)).toDouble())
+        val cx = w / 2f
+        val cy = h / 2f + 10f
+        val radius = (w.coerceAtMost(h) / 2f) - 28f
+        val x1 = cx + kotlin.math.cos(thresholdAngle).toFloat() * (radius - 18f)
+        val y1 = cy + kotlin.math.sin(thresholdAngle).toFloat() * (radius - 18f)
+        val x2 = cx + kotlin.math.cos(thresholdAngle).toFloat() * (radius + 4f)
+        val y2 = cy + kotlin.math.sin(thresholdAngle).toFloat() * (radius + 4f)
+        canvas.drawLine(x1, y1, x2, y2, thresholdPaint)
+
+        canvas.drawText(valueText, cx, h * 0.58f, labelPaint)
+        canvas.drawText(label, cx, h * 0.75f, subLabelPaint)
+    }
+}
+
+private fun formatStaticBytes(bytes: Long): String {
+    val value = bytes.toDouble()
+    return when {
+        value >= 1024 * 1024 * 1024 -> String.format("%.2f GB", value / (1024 * 1024 * 1024))
+        value >= 1024 * 1024 -> String.format("%.2f MB", value / (1024 * 1024))
+        value >= 1024 -> String.format("%.2f KB", value / 1024)
+        else -> "$bytes B"
     }
 }
