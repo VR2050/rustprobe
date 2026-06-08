@@ -14,7 +14,7 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@android:drawable/sym_def_app_icon"
+        android:icon="@mipmap/ic_launcher"
         android:label="RustProbe"
         android:supportsRtl="true"
         android:theme="@style/Theme.RustProbe">

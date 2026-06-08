@@ -557,6 +557,7 @@ dependencies = [
  "rustprobe-attrib",
  "rustprobe-core",
  "rustprobe-flow",
+ "rustprobe-metrics",
  "rustprobe-parse",
  "rustprobe-store",
 ]

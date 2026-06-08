@@ -304,7 +304,7 @@ class RustProbeVpnService : VpnService() {
 
     private fun resetOutputSessionFiles(clearForwarding: Boolean, clearCapture: Boolean) {
         val outputDir = File(filesDir, "rustprobe-output").apply { mkdirs() }
-        val captureFiles = listOf("flows.jsonl", "objects.jsonl")
+        val captureFiles = listOf("flows.jsonl", "objects.jsonl", "analytics.jsonl")
         val forwardingFiles = listOf(
             "forwarding-events.jsonl",
             "forwarding-socks5.log",

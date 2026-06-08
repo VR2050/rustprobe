@@ -299,6 +299,47 @@ pub struct AppMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrafficSeriesPoint {
+    pub bucket_start_unix_ms: u128,
+    pub bytes: u64,
+    pub packets: u64,
+    pub hits: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedMetric {
+    pub label: String,
+    pub bytes: u64,
+    pub packets: u64,
+    pub hits: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppTrafficView {
+    pub scope: String,
+    pub app: Option<AppIdentity>,
+    pub total_bytes: u64,
+    pub total_packets: u64,
+    pub active_flows: usize,
+    pub protocol_distribution: Vec<RankedMetric>,
+    pub top_ips: Vec<RankedMetric>,
+    pub top_domains: Vec<RankedMetric>,
+    pub top_ports: Vec<RankedMetric>,
+    pub traffic_series: Vec<TrafficSeriesPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppTrafficAnalyticsSnapshot {
+    pub generated_at_unix_ms: u128,
+    pub window_start_unix_ms: u128,
+    pub window_end_unix_ms: u128,
+    pub bucket_size_ms: u64,
+    pub bucket_count: usize,
+    pub overall: AppTrafficView,
+    pub apps: Vec<AppTrafficView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertRecord {
     pub title: String,
     pub summary: String,

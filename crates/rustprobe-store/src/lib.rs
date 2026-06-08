@@ -1,4 +1,4 @@
-use rustprobe_core::{AlertEvent, FlowEvent, FlowState, ObjectState};
+use rustprobe_core::{AlertEvent, AppTrafficAnalyticsSnapshot, FlowEvent, FlowState, ObjectState};
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -24,8 +24,10 @@ pub struct JsonlStore {
     root: PathBuf,
     flow_writer: BufWriter<File>,
     object_writer: BufWriter<File>,
+    analytics_writer: BufWriter<File>,
     pending_flow_writes: usize,
     pending_object_writes: usize,
+    pending_analytics_writes: usize,
     last_flush_at: Instant,
 }
 
@@ -47,13 +49,16 @@ impl JsonlStore {
 
         let flow_writer = open_writer(root.join("flows.jsonl"), truncate)?;
         let object_writer = open_writer(root.join("objects.jsonl"), truncate)?;
+        let analytics_writer = open_writer(root.join("analytics.jsonl"), truncate)?;
 
         Ok(Self {
             root,
             flow_writer,
             object_writer,
+            analytics_writer,
             pending_flow_writes: 0,
             pending_object_writes: 0,
+            pending_analytics_writes: 0,
             last_flush_at: Instant::now(),
         })
     }
@@ -80,17 +85,31 @@ impl JsonlStore {
         Ok(())
     }
 
+    pub fn append_analytics_snapshot(
+        &mut self,
+        snapshot: &AppTrafficAnalyticsSnapshot,
+    ) -> anyhow::Result<()> {
+        serde_json::to_writer(&mut self.analytics_writer, snapshot)?;
+        self.analytics_writer.write_all(b"\n")?;
+        self.pending_analytics_writes += 1;
+        self.flush_if_needed()?;
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> anyhow::Result<()> {
         self.flow_writer.flush()?;
         self.object_writer.flush()?;
+        self.analytics_writer.flush()?;
         self.pending_flow_writes = 0;
         self.pending_object_writes = 0;
+        self.pending_analytics_writes = 0;
         self.last_flush_at = Instant::now();
         Ok(())
     }
 
     pub fn flush_if_due(&mut self) -> anyhow::Result<()> {
-        let pending_writes = self.pending_flow_writes + self.pending_object_writes;
+        let pending_writes =
+            self.pending_flow_writes + self.pending_object_writes + self.pending_analytics_writes;
         if pending_writes > 0 && self.last_flush_at.elapsed() >= Self::FLUSH_INTERVAL {
             self.flush()?;
         }
@@ -98,7 +117,8 @@ impl JsonlStore {
     }
 
     fn flush_if_needed(&mut self) -> anyhow::Result<()> {
-        let pending_writes = self.pending_flow_writes + self.pending_object_writes;
+        let pending_writes =
+            self.pending_flow_writes + self.pending_object_writes + self.pending_analytics_writes;
         if pending_writes >= Self::MAX_PENDING_WRITES
             || self.last_flush_at.elapsed() >= Self::FLUSH_INTERVAL
         {

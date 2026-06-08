@@ -574,7 +574,7 @@ fn parse_dns_query_name(payload: &[u8]) -> Option<String> {
         if label.is_empty() {
             return None;
         }
-        labels.push(label.to_ascii_lowercase());
+        labels.push(sanitize_dns_label(label)?);
         offset = end;
     }
 
@@ -1243,6 +1243,7 @@ pub fn parse_http_request_metadata(payload: &[u8]) -> Option<HttpRequestMetadata
     }
 
     let host = host?;
+    let host = sanitize_host_like(&host)?;
     let target_lower = target.to_ascii_lowercase();
     let is_doh = target_lower.contains("dns-query")
         || content_type
@@ -1257,7 +1258,7 @@ pub fn parse_http_request_metadata(payload: &[u8]) -> Option<HttpRequestMetadata
 
     Some(HttpRequestMetadata {
         host,
-        target: target.to_string(),
+        target: sanitize_visible_text(target)?,
         is_doh,
     })
 }
@@ -1283,9 +1284,8 @@ fn parse_tls_alpn_extension(extension: &[u8]) -> Option<Vec<String>> {
         let protocol_len = *extension.get(offset)? as usize;
         offset += 1;
         let protocol_end = offset.checked_add(protocol_len)?;
-        let protocol = std::str::from_utf8(extension.get(offset..protocol_end)?)
-            .ok()?
-            .to_ascii_lowercase();
+        let protocol = std::str::from_utf8(extension.get(offset..protocol_end)?).ok()?;
+        let protocol = sanitize_token(protocol)?.to_ascii_lowercase();
         if !protocol.is_empty() {
             protocols.push(protocol);
         }
@@ -1343,7 +1343,8 @@ fn parse_tls_sni_extension(extension: &[u8]) -> Option<String> {
         let name = extension.get(offset..name_end)?;
 
         if name_type == 0 {
-            let server_name = std::str::from_utf8(name).ok()?.to_ascii_lowercase();
+            let server_name = std::str::from_utf8(name).ok()?;
+            let server_name = sanitize_host_like(server_name)?;
             if !server_name.is_empty() {
                 return Some(server_name);
             }
@@ -1353,4 +1354,90 @@ fn parse_tls_sni_extension(extension: &[u8]) -> Option<String> {
     }
 
     None
+}
+
+fn sanitize_dns_label(label: &str) -> Option<String> {
+    let normalized = label.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > 63 {
+        return None;
+    }
+    if normalized.starts_with('-') || normalized.ends_with('-') {
+        return None;
+    }
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn sanitize_host_like(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > 255 {
+        return None;
+    }
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | '[' | ']'))
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn sanitize_visible_text(value: &str) -> Option<String> {
+    let sanitized = value
+        .chars()
+        .filter(|ch| ch.is_ascii() && !ch.is_ascii_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn sanitize_token(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > 64 {
+        return None;
+    }
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_dns_query_name_over_tcp, parse_http_request_metadata};
+
+    #[test]
+    fn rejects_dns_names_with_control_characters() {
+        let payload = [
+            0x00, 0x16, 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, b'w', 0x00, b'w', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c',
+            b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        assert!(parse_dns_query_name_over_tcp(&payload).is_none());
+    }
+
+    #[test]
+    fn parses_http_host_as_sanitized_lowercase() {
+        let payload = b"GET /dns-query HTTP/1.1\r\nHost: Example.COM\r\nAccept: application/dns-message\r\n\r\n";
+        let metadata = parse_http_request_metadata(payload).expect("http metadata");
+        assert_eq!(metadata.host, "example.com");
+        assert_eq!(metadata.target, "/dns-query");
+        assert!(metadata.is_doh);
+    }
 }

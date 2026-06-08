@@ -11,5 +11,6 @@ libc.workspace = true
 rustprobe-attrib = { path = "../rustprobe-attrib" }
 rustprobe-core = { path = "../rustprobe-core" }
 rustprobe-flow = { path = "../rustprobe-flow" }
+rustprobe-metrics = { path = "../rustprobe-metrics" }
 rustprobe-parse = { path = "../rustprobe-parse" }
 rustprobe-store = { path = "../rustprobe-store" }

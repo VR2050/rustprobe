@@ -2,14 +2,15 @@ use async_trait::async_trait;
 use rustprobe_attrib::{attribute_flow_runtime, attribution_stats, queue_owner_query_runtime};
 use rustprobe_core::{Actor, ActorRef, FlowKey, FlowState, PacketEvent, ParsedPacket};
 use rustprobe_flow::FlowActor;
+use rustprobe_metrics::{AppTrafficAnalyticsActor, TrafficObservation};
 use rustprobe_parse::ParserStage;
 use rustprobe_store::JsonlStore;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -115,8 +116,9 @@ fn log_error(message: impl AsRef<str>) {
 fn log_android(priority: i32, message: &str) {
     use std::ffi::CString;
 
+    let sanitized_message = message.replace('\0', "\\0");
     let tag = CString::new(LOG_TAG).expect("valid android log tag");
-    let text = CString::new(message).unwrap_or_else(|_| {
+    let text = CString::new(sanitized_message).unwrap_or_else(|_| {
         CString::new("rustprobe-capture: invalid log message").expect("fallback cstring")
     });
     unsafe {
@@ -158,6 +160,7 @@ impl Actor for TunCaptureActor {
 struct CaptureRuntime {
     parser: ParserStage,
     flow_actor: FlowActor,
+    analytics: AppTrafficAnalyticsActor,
     store: Option<JsonlStore>,
     profile: RuntimeProfile,
     summary_interval: Duration,
@@ -196,6 +199,7 @@ impl CaptureRuntime {
         Self {
             parser: ParserStage,
             flow_actor: FlowActor::default(),
+            analytics: AppTrafficAnalyticsActor::default(),
             store,
             profile,
             summary_interval: profile.summary_interval(),
@@ -242,6 +246,7 @@ impl CaptureRuntime {
 
     fn finish(mut self) {
         self.log_summary();
+        self.persist_analytics_snapshot();
         if let Some(store) = self.store.as_mut() {
             let _ = store.flush();
         }
@@ -250,6 +255,7 @@ impl CaptureRuntime {
     fn flush_and_log_if_due(&mut self) {
         if self.last_summary_at.elapsed() >= self.summary_interval {
             self.log_summary();
+            self.persist_analytics_snapshot();
             if let Some(store) = self.store.as_mut() {
                 let _ = store.flush_if_due();
             }
@@ -271,6 +277,19 @@ impl CaptureRuntime {
                 let _ = self
                     .flow_actor
                     .set_flow_app(&flow.flow.key, flow.flow.app.clone());
+            }
+
+            if let Some(dst_port) = parsed.dst_port {
+                self.analytics.observe(TrafficObservation {
+                    observed_at_unix_ms: rustprobe_core::now_unix_ms(),
+                    app: flow.flow.app.clone(),
+                    protocol: flow.flow.protocol_hint.clone(),
+                    dst_addr: flow.flow.key.dst_addr.clone(),
+                    domain: flow.flow.domain.clone(),
+                    dst_port,
+                    bytes: parsed.payload_len as u64,
+                    packets: 1,
+                });
             }
 
             if let Some(app) = app.as_ref() {
@@ -413,11 +432,7 @@ impl CaptureRuntime {
         }
     }
 
-    fn persist_flow(
-        &mut self,
-        flow: &FlowState,
-        touched_objects: &[rustprobe_core::ObjectState],
-    ) {
+    fn persist_flow(&mut self, flow: &FlowState, touched_objects: &[rustprobe_core::ObjectState]) {
         if let Some(store) = self.store.as_mut() {
             if let Err(err) = store.append_flow(flow) {
                 log_error(format!(
@@ -429,6 +444,18 @@ impl CaptureRuntime {
             if let Err(err) = store.append_objects(touched_objects) {
                 log_error(format!(
                     "{} failed to persist object snapshot: {err}",
+                    self.profile.mode_label()
+                ));
+            }
+        }
+    }
+
+    fn persist_analytics_snapshot(&mut self) {
+        let snapshot = self.analytics.snapshot(&self.flow_actor.snapshot());
+        if let Some(store) = self.store.as_mut() {
+            if let Err(err) = store.append_analytics_snapshot(&snapshot) {
+                log_error(format!(
+                    "{} failed to persist analytics snapshot: {err}",
                     self.profile.mode_label()
                 ));
             }
