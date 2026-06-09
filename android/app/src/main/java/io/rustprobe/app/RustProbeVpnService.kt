@@ -32,7 +32,9 @@ class RustProbeVpnService : VpnService() {
         private const val TAG = "RustProbeVpnService"
         private const val STATUS_LOG_INTERVAL_MS = 5_000L
         private const val LOCAL_SOCKS_PORT = 1080
-        private const val FORWARDING_TCP_BUFFER_SIZE = 65_536
+        private const val FORWARDING_TCP_BUFFER_SIZE = 131_072
+        private const val FORWARDING_UDP_RECV_BUFFER_SIZE = 1_048_576
+        private const val FORWARDING_UDP_COPY_BUFFER_COUNT = 32
         private const val NOTIFICATION_CHANNEL_ID = "rustprobe_vpn"
         private const val NOTIFICATION_ID = 1001
 
@@ -145,6 +147,8 @@ class RustProbeVpnService : VpnService() {
                     appendLine("misc:")
                     appendLine("  task-stack-size: 24576")
                     appendLine("  tcp-buffer-size: $FORWARDING_TCP_BUFFER_SIZE")
+                    appendLine("  udp-recv-buffer-size: $FORWARDING_UDP_RECV_BUFFER_SIZE")
+                    appendLine("  udp-copy-buffer-nums: $FORWARDING_UDP_COPY_BUFFER_COUNT")
                     appendLine("  log-file: '$tproxyLogPath'")
                     appendLine("  log-level: info")
                     appendLine("tunnel:")
@@ -153,6 +157,7 @@ class RustProbeVpnService : VpnService() {
                     appendLine("  address: '127.0.0.1'")
                     appendLine("  port: $LOCAL_SOCKS_PORT")
                     appendLine("  udp: 'udp'")
+                    appendLine("  pipeline: true")
                 }.toByteArray(),
             )
         }

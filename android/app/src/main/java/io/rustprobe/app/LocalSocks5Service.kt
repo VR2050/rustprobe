@@ -12,6 +12,8 @@ class LocalSocks5Service : Service() {
         private const val TAG = "LocalSocks5Service"
         const val ACTION_START = "io.rustprobe.app.LOCAL_SOCKS5_START"
         const val ACTION_STOP = "io.rustprobe.app.LOCAL_SOCKS5_STOP"
+        private const val MAX_SOCKS5_WORKERS = 8
+        private const val SOCKS5_UDP_RECV_BUFFER_SIZE = 1_048_576
 
         init {
             runCatching {
@@ -55,6 +57,9 @@ class LocalSocks5Service : Service() {
         super.onDestroy()
     }
 
+    private fun configuredWorkerCount(): Int =
+        Runtime.getRuntime().availableProcessors().coerceIn(2, MAX_SOCKS5_WORKERS)
+
     fun startProxy() {
         if (started) return
 
@@ -62,11 +67,12 @@ class LocalSocks5Service : Service() {
         val configFile = File(cacheDir, "rustprobe-socks5.conf")
         val outputDir = File(filesDir, "rustprobe-output").apply { mkdirs() }
         val logFile = File(outputDir, "forwarding-socks5.log")
+        val workerCount = configuredWorkerCount()
         FileOutputStream(configFile, false).use { output ->
             output.write(
                 buildString {
                     appendLine("main:")
-                    appendLine("  workers: 4")
+                    appendLine("  workers: $workerCount")
                     appendLine("  port: 1080")
                     appendLine("  listen-address: '127.0.0.1'")
                     appendLine("  udp-port: 1080")
@@ -77,13 +83,17 @@ class LocalSocks5Service : Service() {
                     appendLine("  bind-interface: ''")
                     appendLine("misc:")
                     appendLine("  task-stack-size: 24576")
+                    appendLine("  udp-recv-buffer-size: $SOCKS5_UDP_RECV_BUFFER_SIZE")
                     appendLine("  log-file: '${logFile.absolutePath}'")
                     appendLine("  log-level: info")
                 }.toByteArray(),
             )
         }
 
-        Log.i(TAG, "Starting local socks5 proxy with config=${configFile.absolutePath}")
+        Log.i(
+            TAG,
+            "Starting local socks5 proxy with config=${configFile.absolutePath} workers=$workerCount",
+        )
         Socks5StartService(configFile.absolutePath)
         started = true
         Log.i(TAG, "local socks5 proxy started on 127.0.0.1:1080")
