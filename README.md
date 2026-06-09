@@ -28,12 +28,13 @@
 - `forwarding mode`
   - 由 Android 侧本地 `SOCKS5 server` + `tun2socks` 接管 TUN
   - 适合恢复真实联网能力，已在真机上验证通过
-  - 当前暂停了 Rust 的原始 TUN 抓包，但已补上最小可观测性：可从 `forwarding-socks5.log` / `forwarding-tproxy.log` 生成 `forwarding-events.jsonl`
+  - 当前通过 `hev-socks5-tunnel` mirror 把转发链路中的 IPv4 / IPv6 数据包重新送回 Rust 分析线程
+  - 同时保留最小可观测性：可从 `forwarding-socks5.log` / `forwarding-tproxy.log` 生成 `forwarding-events.jsonl`
 
 当前最重要的已知边界：
 
 - `capture mode` 和 `forwarding mode` 还没有合并成“既不断网又保留完整 Rust 分析”的单一路径
-- 转发模式下还没有把 `DNS / SNI / flow` 重新接回完整 Rust 结构化分析输出，当前只有基于 forwarding 日志的最小事件流
+- 转发模式已恢复基础 `flow / DNS / SNI` 结构化分析，但仍需继续提升高流量下的稳定性与覆盖率统计
 - `HTTP` 明文请求解析仍未接入主链路
 - UI 仍是占位骨架，当前重点仍在底层链路与内核能力
 - 测试体系仍然很薄，`cargo test` 与 Android 构建已通过，但工作区里仍缺少实质性的单元测试和集成测试

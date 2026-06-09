@@ -1,6 +1,6 @@
 use rustprobe_core::{
     AppEvent, AppIdentity, AppMetricsSnapshot, AppTrafficAnalyticsSnapshot, AppTrafficView,
-    FlowState, ProtocolHint, RankedMetric, TrafficSeriesPoint, now_unix_ms,
+    FlowState, ProtocolHint, RankedMetric, SharedStr, TrafficSeriesPoint, now_unix_ms,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -15,8 +15,8 @@ pub struct TrafficObservation {
     pub observed_at_unix_ms: u128,
     pub app: Option<AppIdentity>,
     pub protocol: ProtocolHint,
-    pub dst_addr: String,
-    pub domain: Option<String>,
+    pub dst_addr: SharedStr,
+    pub domain: Option<SharedStr>,
     pub dst_port: u16,
     pub bytes: u64,
     pub packets: u64,
@@ -42,10 +42,10 @@ struct BucketStats {
     bytes: u64,
     packets: u64,
     hits: u64,
-    protocols: HashMap<String, MetricCounter>,
-    ips: HashMap<String, MetricCounter>,
-    domains: HashMap<String, MetricCounter>,
-    ports: HashMap<String, MetricCounter>,
+    protocols: HashMap<ProtocolHint, MetricCounter>,
+    ips: HashMap<SharedStr, MetricCounter>,
+    domains: HashMap<SharedStr, MetricCounter>,
+    ports: HashMap<u16, MetricCounter>,
 }
 
 impl BucketStats {
@@ -54,7 +54,7 @@ impl BucketStats {
         self.packets += observation.packets;
         self.hits += 1;
         self.protocols
-            .entry(protocol_label(&observation.protocol))
+            .entry(observation.protocol.clone())
             .or_default()
             .observe(observation.bytes, observation.packets);
         self.ips
@@ -62,7 +62,7 @@ impl BucketStats {
             .or_default()
             .observe(observation.bytes, observation.packets);
         self.ports
-            .entry(observation.dst_port.to_string())
+            .entry(observation.dst_port)
             .or_default()
             .observe(observation.bytes, observation.packets);
         if let Some(domain) = canonicalize_domain(observation.domain.as_deref()) {
@@ -87,10 +87,10 @@ impl BucketStats {
 struct AggregateView {
     total_bytes: u64,
     total_packets: u64,
-    protocols: HashMap<String, MetricCounter>,
-    ips: HashMap<String, MetricCounter>,
-    domains: HashMap<String, MetricCounter>,
-    ports: HashMap<String, MetricCounter>,
+    protocols: HashMap<ProtocolHint, MetricCounter>,
+    ips: HashMap<SharedStr, MetricCounter>,
+    domains: HashMap<SharedStr, MetricCounter>,
+    ports: HashMap<u16, MetricCounter>,
 }
 
 #[derive(Debug, Default)]
@@ -159,6 +159,10 @@ impl AppTrafficAnalyticsActor {
         );
     }
 
+    pub fn bucket_size_ms(&self) -> u64 {
+        self.bucket_size_ms
+    }
+
     pub fn snapshot(&self, active_flows: &[FlowState]) -> AppTrafficAnalyticsSnapshot {
         let generated_at = now_unix_ms();
         let window_end = bucket_start(generated_at, self.bucket_size_ms);
@@ -172,7 +176,11 @@ impl AppTrafficAnalyticsActor {
             .keys()
             .filter(|scope| scope.as_str() != OVERALL_SCOPE)
             .map(|scope| self.build_scope_view(scope, window_start, active_flows))
-            .filter(|view| view.total_bytes > 0 || view.active_flows > 0)
+            .filter(|view| {
+                view.total_bytes > 0
+                    || (view.active_flows > 0
+                        && view.scope != display_scope(UNATTRIBUTED_SCOPE, None))
+            })
             .collect::<Vec<_>>();
 
         apps.sort_by(|left, right| {
@@ -248,10 +256,10 @@ impl AppTrafficAnalyticsActor {
             total_bytes: aggregate.total_bytes,
             total_packets: aggregate.total_packets,
             active_flows: count_active_flows(scope, active_flows, window_start),
-            protocol_distribution: top_ranked_metrics(aggregate.protocols),
+            protocol_distribution: top_ranked_protocols(aggregate.protocols),
             top_ips: top_ranked_metrics(aggregate.ips),
             top_domains: top_ranked_metrics(aggregate.domains),
-            top_ports: top_ranked_metrics(aggregate.ports),
+            top_ports: top_ranked_ports(aggregate.ports),
             traffic_series,
         }
     }
@@ -273,7 +281,7 @@ impl MetricsActor {
     }
 }
 
-fn protocol_label(protocol: &ProtocolHint) -> String {
+fn protocol_label(protocol: &ProtocolHint) -> &'static str {
     match protocol {
         ProtocolHint::Tcp => "TCP",
         ProtocolHint::Udp => "UDP",
@@ -284,7 +292,6 @@ fn protocol_label(protocol: &ProtocolHint) -> String {
         ProtocolHint::Quic => "QUIC",
         ProtocolHint::Unknown => "Unknown",
     }
-    .to_string()
 }
 
 fn bucket_start(timestamp_ms: u128, bucket_size_ms: u64) -> u128 {
@@ -292,7 +299,10 @@ fn bucket_start(timestamp_ms: u128, bucket_size_ms: u64) -> u128 {
     (timestamp_ms / size) * size
 }
 
-fn merge_map(target: &mut HashMap<String, MetricCounter>, source: &HashMap<String, MetricCounter>) {
+fn merge_map<K>(target: &mut HashMap<K, MetricCounter>, source: &HashMap<K, MetricCounter>)
+where
+    K: Clone + Eq + std::hash::Hash,
+{
     for (label, counter) in source {
         let entry = target.entry(label.clone()).or_default();
         entry.bytes += counter.bytes;
@@ -301,11 +311,56 @@ fn merge_map(target: &mut HashMap<String, MetricCounter>, source: &HashMap<Strin
     }
 }
 
-fn top_ranked_metrics(map: HashMap<String, MetricCounter>) -> Vec<RankedMetric> {
+fn top_ranked_metrics<K>(map: HashMap<K, MetricCounter>) -> Vec<RankedMetric>
+where
+    K: AsRef<str>,
+{
     let mut items = map
         .into_iter()
         .map(|(label, counter)| RankedMetric {
-            label,
+            label: label.as_ref().to_string(),
+            bytes: counter.bytes,
+            packets: counter.packets,
+            hits: counter.hits,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| right.hits.cmp(&left.hits))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    items.truncate(TOP_LIMIT);
+    items
+}
+
+fn top_ranked_protocols(map: HashMap<ProtocolHint, MetricCounter>) -> Vec<RankedMetric> {
+    let mut items = map
+        .into_iter()
+        .map(|(protocol, counter)| RankedMetric {
+            label: protocol_label(&protocol).to_string(),
+            bytes: counter.bytes,
+            packets: counter.packets,
+            hits: counter.hits,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| right.hits.cmp(&left.hits))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    items.truncate(TOP_LIMIT);
+    items
+}
+
+fn top_ranked_ports(map: HashMap<u16, MetricCounter>) -> Vec<RankedMetric> {
+    let mut items = map
+        .into_iter()
+        .map(|(port, counter)| RankedMetric {
+            label: port.to_string(),
             bytes: counter.bytes,
             packets: counter.packets,
             hits: counter.hits,
@@ -326,7 +381,7 @@ fn display_scope(scope: &str, app: Option<&AppIdentity>) -> String {
     if scope == OVERALL_SCOPE {
         "All Monitored Apps".to_string()
     } else if scope == UNATTRIBUTED_SCOPE {
-        "Unattributed".to_string()
+        "Unresolved App".to_string()
     } else if let Some(app) = app {
         app.package_name.clone()
     } else {
@@ -334,11 +389,11 @@ fn display_scope(scope: &str, app: Option<&AppIdentity>) -> String {
     }
 }
 
-fn canonicalize_domain(domain: Option<&str>) -> Option<String> {
+fn canonicalize_domain(domain: Option<&str>) -> Option<SharedStr> {
     domain
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+        .map(|value| rustprobe_core::shared_str(value.trim_end_matches('.').to_ascii_lowercase()))
         .filter(|value| !value.is_empty())
 }
 
@@ -346,16 +401,14 @@ fn count_active_flows(scope: &str, flows: &[FlowState], window_start: u128) -> u
     flows
         .iter()
         .filter(|flow| flow.last_seen_unix_ms >= window_start)
-        .filter(|flow| {
-            match scope {
-                OVERALL_SCOPE => true,
-                UNATTRIBUTED_SCOPE => flow.app.is_none(),
-                package_name => flow
-                    .app
-                    .as_ref()
-                    .map(|app| app.package_name.as_str() == package_name)
-                    .unwrap_or(false),
-            }
+        .filter(|flow| match scope {
+            OVERALL_SCOPE => true,
+            UNATTRIBUTED_SCOPE => flow.app.is_none(),
+            package_name => flow
+                .app
+                .as_ref()
+                .map(|app| app.package_name.as_str() == package_name)
+                .unwrap_or(false),
         })
         .count()
 }

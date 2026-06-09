@@ -19,6 +19,7 @@ object RustBridge {
     external fun nativeStopCapture()
     external fun nativeIsCaptureRunning(): Boolean
     external fun nativePacketsSeen(): Int
+    external fun nativeCaptureStats(): String
     external fun nativeSyncInstalledApps(appsJson: String): Boolean
     external fun nativeUpsertApp(appJson: String): Boolean
     external fun nativeSetMonitoringSelection(selectionJson: String): Boolean
@@ -112,6 +113,19 @@ object RustBridge {
             totalOwnerQueriesDrained = json.optLong("total_owner_queries_drained"),
             totalOwnerQueriesSkipped = json.optLong("total_owner_queries_skipped"),
             totalOwnerResolutions = json.optLong("total_owner_resolutions"),
+        )
+    }
+
+    fun captureStats(): CaptureStats {
+        val json = JSONObject(nativeCaptureStats())
+        return CaptureStats(
+            captureRunning = json.optBoolean("capture_running"),
+            packetsSeen = json.optLong("packets_seen"),
+            mirroredPacketsReceived = json.optLong("mirrored_packets_received"),
+            mirroredPacketsAccepted = json.optLong("mirrored_packets_accepted"),
+            mirroredPacketsDropped = json.optLong("mirrored_packets_dropped"),
+            mirroredDropRatio = json.optDouble("mirrored_drop_ratio"),
+            mirroredIngestQueueCapacity = json.optInt("mirrored_ingest_queue_capacity"),
         )
     }
 }

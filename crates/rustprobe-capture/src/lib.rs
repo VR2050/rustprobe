@@ -5,12 +5,13 @@ use rustprobe_flow::FlowActor;
 use rustprobe_metrics::{AppTrafficAnalyticsActor, TrafficObservation};
 use rustprobe_parse::ParserStage;
 use rustprobe_store::JsonlStore;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -18,6 +19,8 @@ use std::time::{Duration, Instant};
 
 static CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
 static PACKETS_SEEN: AtomicU64 = AtomicU64::new(0);
+static MIRRORED_PACKETS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+static MIRRORED_PACKETS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static MIRRORED_PACKETS_DROPPED: AtomicU64 = AtomicU64::new(0);
 static OUTPUT_ROOT: OnceLock<Mutex<PathBuf>> = OnceLock::new();
 static MIRRORED_INGEST_SENDER: OnceLock<Mutex<Option<SyncSender<Vec<u8>>>>> = OnceLock::new();
@@ -25,7 +28,20 @@ static MIRRORED_INGEST_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLoc
 
 const LOG_TAG: &str = "rustprobe-capture";
 const OWNER_QUERY_RETRY_PACKET_INTERVAL: u64 = 16;
-const MIRRORED_INGEST_QUEUE_CAPACITY: usize = 2048;
+const FORWARD_OWNER_QUERY_RETRY_PACKET_INTERVAL: u64 = 64;
+const MIRRORED_INGEST_QUEUE_CAPACITY: usize = 32 * 1024;
+const FORWARD_DRAIN_BATCH_LIMIT: usize = 256;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CaptureStats {
+    pub capture_running: bool,
+    pub packets_seen: u64,
+    pub mirrored_packets_received: u64,
+    pub mirrored_packets_accepted: u64,
+    pub mirrored_packets_dropped: u64,
+    pub mirrored_drop_ratio: f64,
+    pub mirrored_ingest_queue_capacity: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeProfile {
@@ -80,12 +96,42 @@ impl RuntimeProfile {
     fn persist_packet_interval(self) -> u64 {
         match self {
             Self::Capture => 1,
-            Self::Forward => 32,
+            Self::Forward => 256,
         }
     }
 
     fn log_owner_query_events(self) -> bool {
         matches!(self, Self::Capture)
+    }
+
+    fn log_flow_attribution_events(self) -> bool {
+        matches!(self, Self::Capture)
+    }
+
+    fn log_first_flow_packet(self, flow: &FlowState) -> bool {
+        match self {
+            Self::Capture => true,
+            Self::Forward => {
+                flow.domain.is_some()
+                    || flow.tls_server_name.is_some()
+                    || flow.quic_server_name.is_some()
+                    || flow.http_host.is_some()
+                    || flow.app.is_some()
+            }
+        }
+    }
+
+    fn persist_first_flow_packet(self, flow: &FlowState) -> bool {
+        match self {
+            Self::Capture => true,
+            Self::Forward => {
+                flow.app.is_some()
+                    || flow.domain.is_some()
+                    || flow.http_host.is_some()
+                    || flow.tls_server_name.is_some()
+                    || flow.quic_server_name.is_some()
+            }
+        }
     }
 }
 
@@ -174,6 +220,30 @@ struct CaptureRuntime {
     owner_query_requests: u64,
     owner_query_enqueued: u64,
     persisted_flows: HashMap<FlowKey, PersistedFlowMarker>,
+    pending_attribution_observations: HashMap<FlowKey, PendingAttributionFlow>,
+    pending_attribution_packets: u64,
+    pending_attribution_flushed_packets: u64,
+    unresolved_expired_packets: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PendingAttributionKey {
+    bucket_start_unix_ms: u128,
+    protocol: rustprobe_core::ProtocolHint,
+    dst_addr: rustprobe_core::SharedStr,
+    domain: Option<rustprobe_core::SharedStr>,
+    dst_port: u16,
+}
+
+#[derive(Debug, Default)]
+struct PendingAttributionCounter {
+    bytes: u64,
+    packets: u64,
+}
+
+#[derive(Debug, Default)]
+struct PendingAttributionFlow {
+    observations: HashMap<PendingAttributionKey, PendingAttributionCounter>,
 }
 
 impl CaptureRuntime {
@@ -213,6 +283,10 @@ impl CaptureRuntime {
             owner_query_requests: 0,
             owner_query_enqueued: 0,
             persisted_flows: HashMap::new(),
+            pending_attribution_observations: HashMap::new(),
+            pending_attribution_packets: 0,
+            pending_attribution_flushed_packets: 0,
+            unresolved_expired_packets: 0,
         }
     }
 
@@ -280,21 +354,24 @@ impl CaptureRuntime {
             }
 
             if let Some(dst_port) = parsed.dst_port {
-                self.analytics.observe(TrafficObservation {
-                    observed_at_unix_ms: rustprobe_core::now_unix_ms(),
-                    app: flow.flow.app.clone(),
-                    protocol: flow.flow.protocol_hint.clone(),
-                    dst_addr: flow.flow.key.dst_addr.clone(),
-                    domain: flow.flow.domain.clone(),
-                    dst_port,
-                    bytes: size as u64,
-                    packets: 1,
-                });
+                self.observe_flow_traffic(
+                    &flow.flow,
+                    TrafficObservation {
+                        observed_at_unix_ms: rustprobe_core::now_unix_ms(),
+                        app: flow.flow.app.clone(),
+                        protocol: flow.flow.protocol_hint.clone(),
+                        dst_addr: flow.flow.key.dst_addr.clone(),
+                        domain: flow.flow.domain.clone(),
+                        dst_port,
+                        bytes: size as u64,
+                        packets: 1,
+                    },
+                );
             }
 
             if let Some(app) = app.as_ref() {
                 self.attributed_flow_packets += 1;
-                if flow.flow.packets == 1 {
+                if flow.flow.packets == 1 && self.profile.log_flow_attribution_events() {
                     log_info(format!(
                         "{} flow attributed transport={:?} protocol_hint={:?} {}:{} -> {}:{} app={} uid={}",
                         self.profile.mode_label(),
@@ -310,7 +387,7 @@ impl CaptureRuntime {
                 }
             } else {
                 self.unattributed_flow_packets += 1;
-                if should_queue_owner_query(flow.flow.packets) {
+                if should_queue_owner_query(self.profile, flow.flow.packets) {
                     self.owner_query_requests += 1;
                     match queue_owner_query_runtime(flow.flow.key.clone()) {
                         Ok(enqueued) => {
@@ -462,6 +539,93 @@ impl CaptureRuntime {
         }
     }
 
+    fn observe_flow_traffic(&mut self, flow: &FlowState, observation: TrafficObservation) {
+        if let Some(app) = flow.app.clone() {
+            self.flush_pending_attribution(flow.key.clone(), app.clone());
+            let mut observation = observation;
+            observation.app = Some(app);
+            self.analytics.observe(observation);
+            return;
+        }
+
+        self.pending_attribution_packets += observation.packets;
+        let bucket_start_unix_ms = bucket_start(
+            observation.observed_at_unix_ms,
+            self.analytics.bucket_size_ms(),
+        );
+        let flow_state = self
+            .pending_attribution_observations
+            .entry(flow.key.clone())
+            .or_default();
+        let counter = flow_state
+            .observations
+            .entry(PendingAttributionKey {
+                bucket_start_unix_ms,
+                protocol: observation.protocol,
+                dst_addr: observation.dst_addr,
+                domain: observation.domain,
+                dst_port: observation.dst_port,
+            })
+            .or_default();
+        counter.bytes += observation.bytes;
+        counter.packets += observation.packets;
+    }
+
+    fn flush_pending_attribution(&mut self, key: FlowKey, app: rustprobe_core::AppIdentity) {
+        let Some(observations) = self.pending_attribution_observations.remove(&key) else {
+            return;
+        };
+
+        for (pending_key, counter) in observations.observations {
+            self.pending_attribution_flushed_packets += counter.packets;
+            self.analytics.observe(TrafficObservation {
+                observed_at_unix_ms: pending_key.bucket_start_unix_ms,
+                app: Some(app.clone()),
+                protocol: pending_key.protocol,
+                dst_addr: pending_key.dst_addr,
+                domain: pending_key.domain,
+                dst_port: pending_key.dst_port,
+                bytes: counter.bytes,
+                packets: counter.packets,
+            });
+        }
+    }
+
+    fn flush_pending_attribution_for_expired_flow(&mut self, flow: &FlowState) {
+        let Some(observations) = self.pending_attribution_observations.remove(&flow.key) else {
+            return;
+        };
+
+        let app = flow.app.clone();
+        for (pending_key, counter) in observations.observations {
+            if let Some(app) = app.clone() {
+                self.pending_attribution_flushed_packets += counter.packets;
+                self.analytics.observe(TrafficObservation {
+                    observed_at_unix_ms: pending_key.bucket_start_unix_ms,
+                    app: Some(app),
+                    protocol: pending_key.protocol,
+                    dst_addr: pending_key.dst_addr,
+                    domain: pending_key.domain,
+                    dst_port: pending_key.dst_port,
+                    bytes: counter.bytes,
+                    packets: counter.packets,
+                });
+            } else {
+                self.unresolved_expired_packets += counter.packets;
+                self.analytics.observe(TrafficObservation {
+                    observed_at_unix_ms: pending_key.bucket_start_unix_ms,
+                    app: None,
+                    protocol: pending_key.protocol,
+                    dst_addr: pending_key.dst_addr,
+                    domain: pending_key.domain,
+                    dst_port: pending_key.dst_port,
+                    bytes: counter.bytes,
+                    packets: counter.packets,
+                });
+            }
+        }
+    }
+
     fn should_persist_flow(&mut self, flow: &FlowState) -> bool {
         if self.profile.persist_every_packet() {
             return true;
@@ -473,9 +637,12 @@ impl CaptureRuntime {
             || (flow.http_host.is_some() && !marker.had_http_host)
             || (flow.tls_server_name.is_some() && !marker.had_tls_server_name)
             || (flow.quic_server_name.is_some() && !marker.had_quic_server_name);
-        let reached_packet_checkpoint = flow.packets == 1
-            || flow.packets
-                >= marker.last_persisted_packet_count + self.profile.persist_packet_interval();
+        let reached_packet_checkpoint = if flow.packets == 1 {
+            self.profile.persist_first_flow_packet(flow)
+        } else {
+            flow.packets
+                >= marker.last_persisted_packet_count + self.profile.persist_packet_interval()
+        };
 
         if discovered_metadata || reached_packet_checkpoint {
             marker.last_persisted_packet_count = flow.packets;
@@ -497,10 +664,14 @@ impl CaptureRuntime {
         }
 
         self.last_expire_scan_at = Instant::now();
-        let expired = self.flow_actor.expire_idle_flows();
+        let expired_flows = self.flow_actor.take_expired_flows();
+        let expired = expired_flows.len();
         if expired > 0 {
             self.persisted_flows
                 .retain(|key, _| self.flow_actor.has_flow(key));
+            for flow in expired_flows {
+                self.flush_pending_attribution_for_expired_flow(&flow);
+            }
         }
         expired
     }
@@ -508,17 +679,21 @@ impl CaptureRuntime {
     fn log_summary(&self) {
         let attrib = attribution_stats();
         log_info(format!(
-            "{} summary packets_seen={} mirrored_packets_dropped={} active_flows={} tracked_objects={} parse_errors={} non_flow_packets={} would_block_reads={} attributed_flow_packets={} unattributed_flow_packets={} owner_query_requests={} owner_query_enqueued={} tracked_apps={} cached_flow_owners={} pending_owner_queries={} owner_queries_enqueued_total={} owner_queries_drained={} owner_queries_skipped={} owner_resolutions={}",
+            "{} summary packets_seen={} mirrored_packets_dropped={} active_flows={} tracked_objects={} parse_errors={} non_flow_packets={} would_block_reads={} attributed_flow_packets={} unattributed_flow_packets={} pending_attribution_flows={} pending_attribution_packets={} pending_attribution_flushed_packets={} unresolved_expired_packets={} owner_query_requests={} owner_query_enqueued={} tracked_apps={} cached_flow_owners={} pending_owner_queries={} owner_queries_enqueued_total={} owner_queries_drained={} owner_queries_skipped={} owner_resolutions={}",
             self.profile.mode_label(),
             PACKETS_SEEN.load(Ordering::Relaxed),
             MIRRORED_PACKETS_DROPPED.load(Ordering::Relaxed),
             self.flow_actor.active_flows(),
-            self.flow_actor.object_snapshot().len(),
+            self.flow_actor.object_count(),
             self.parse_errors,
             self.non_flow_packets,
             self.would_block_reads,
             self.attributed_flow_packets,
             self.unattributed_flow_packets,
+            self.pending_attribution_observations.len(),
+            self.pending_attribution_packets,
+            self.pending_attribution_flushed_packets,
+            self.unresolved_expired_packets,
             self.owner_query_requests,
             self.owner_query_enqueued,
             attrib.tracked_apps,
@@ -548,6 +723,11 @@ fn mirrored_ingest_thread_slot() -> &'static Mutex<Option<JoinHandle<()>>> {
     MIRRORED_INGEST_THREAD.get_or_init(|| Mutex::new(None))
 }
 
+fn bucket_start(timestamp_ms: u128, bucket_size_ms: u64) -> u128 {
+    let size = bucket_size_ms as u128;
+    (timestamp_ms / size) * size
+}
+
 pub fn set_output_root(path: impl Into<PathBuf>) {
     let path = path.into();
     let root = OUTPUT_ROOT.get_or_init(|| Mutex::new(PathBuf::from("rustprobe-output")));
@@ -559,6 +739,8 @@ pub fn start_capture_from_fd(fd: RawFd) -> anyhow::Result<bool> {
         return Ok(false);
     }
     PACKETS_SEEN.store(0, Ordering::SeqCst);
+    MIRRORED_PACKETS_RECEIVED.store(0, Ordering::SeqCst);
+    MIRRORED_PACKETS_ACCEPTED.store(0, Ordering::SeqCst);
     MIRRORED_PACKETS_DROPPED.store(0, Ordering::SeqCst);
     clear_mirrored_runtime();
 
@@ -614,6 +796,8 @@ pub fn start_mirrored_capture() -> anyhow::Result<bool> {
     }
 
     PACKETS_SEEN.store(0, Ordering::SeqCst);
+    MIRRORED_PACKETS_RECEIVED.store(0, Ordering::SeqCst);
+    MIRRORED_PACKETS_ACCEPTED.store(0, Ordering::SeqCst);
     MIRRORED_PACKETS_DROPPED.store(0, Ordering::SeqCst);
     clear_mirrored_runtime();
 
@@ -633,7 +817,10 @@ pub fn start_mirrored_capture() -> anyhow::Result<bool> {
 
             loop {
                 match receiver.recv_timeout(Duration::from_millis(100)) {
-                    Ok(bytes) => runtime.ingest_bytes(&bytes),
+                    Ok(bytes) => {
+                        runtime.ingest_bytes(&bytes);
+                        drain_forward_queue(&receiver, &mut runtime);
+                    }
                     Err(RecvTimeoutError::Timeout) => {
                         if !CAPTURE_RUNNING.load(Ordering::SeqCst) {
                             break;
@@ -663,6 +850,8 @@ pub fn ingest_mirrored_packet(bytes: &[u8]) -> bool {
         return false;
     }
 
+    MIRRORED_PACKETS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+
     let sender = mirrored_ingest_sender_slot()
         .lock()
         .expect("mirrored ingest sender mutex poisoned")
@@ -672,12 +861,15 @@ pub fn ingest_mirrored_packet(bytes: &[u8]) -> bool {
     };
 
     match sender.try_send(bytes.to_vec()) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
+        Ok(()) => {
+            MIRRORED_PACKETS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(mpsc::TrySendError::Full(_)) => {
             MIRRORED_PACKETS_DROPPED.fetch_add(1, Ordering::Relaxed);
             false
         }
-        Err(TrySendError::Disconnected(_)) => false,
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -692,6 +884,26 @@ pub fn is_capture_running() -> bool {
 
 pub fn packets_seen() -> u64 {
     PACKETS_SEEN.load(Ordering::SeqCst)
+}
+
+pub fn capture_stats() -> CaptureStats {
+    let mirrored_packets_received = MIRRORED_PACKETS_RECEIVED.load(Ordering::Relaxed);
+    let mirrored_packets_dropped = MIRRORED_PACKETS_DROPPED.load(Ordering::Relaxed);
+    let mirrored_drop_ratio = if mirrored_packets_received == 0 {
+        0.0
+    } else {
+        mirrored_packets_dropped as f64 / mirrored_packets_received as f64
+    };
+
+    CaptureStats {
+        capture_running: is_capture_running(),
+        packets_seen: packets_seen(),
+        mirrored_packets_received,
+        mirrored_packets_accepted: MIRRORED_PACKETS_ACCEPTED.load(Ordering::Relaxed),
+        mirrored_packets_dropped,
+        mirrored_drop_ratio,
+        mirrored_ingest_queue_capacity: MIRRORED_INGEST_QUEUE_CAPACITY,
+    }
 }
 
 fn clear_mirrored_runtime() {
@@ -727,14 +939,14 @@ fn should_log_flow_packet(
 
     count <= early_packet_limit
         || count.is_multiple_of(profile.flow_log_interval())
-        || flow.packets == 1
+        || (flow.packets == 1 && profile.log_first_flow_packet(flow))
         || (profile == RuntimeProfile::Capture && flow.domain.is_some())
         || (profile == RuntimeProfile::Capture && flow.tls_server_name.is_some())
         || (profile == RuntimeProfile::Capture && flow.quic_server_name.is_some())
         || (profile == RuntimeProfile::Capture && flow.http_host.is_some())
-        || parsed.doh_candidate
-        || parsed.dot_candidate
-        || parsed.http3_candidate
+        || (profile == RuntimeProfile::Capture && parsed.doh_candidate)
+        || (profile == RuntimeProfile::Capture && parsed.dot_candidate)
+        || (profile == RuntimeProfile::Capture && parsed.http3_candidate)
 }
 
 fn should_log_non_flow_packet(profile: RuntimeProfile, count: u64, parsed: &ParsedPacket) -> bool {
@@ -745,14 +957,28 @@ fn should_log_non_flow_packet(profile: RuntimeProfile, count: u64, parsed: &Pars
 
     count <= early_packet_limit
         || count.is_multiple_of(profile.non_flow_log_interval())
-        || parsed.dns_candidate
-        || parsed.tls_candidate
-        || parsed.quic_candidate
-        || parsed.doh_candidate
-        || parsed.dot_candidate
-        || parsed.http3_candidate
+        || (profile == RuntimeProfile::Capture && parsed.dns_candidate)
+        || (profile == RuntimeProfile::Capture && parsed.tls_candidate)
+        || (profile == RuntimeProfile::Capture && parsed.quic_candidate)
+        || (profile == RuntimeProfile::Capture && parsed.doh_candidate)
+        || (profile == RuntimeProfile::Capture && parsed.dot_candidate)
+        || (profile == RuntimeProfile::Capture && parsed.http3_candidate)
 }
 
-fn should_queue_owner_query(flow_packets: u64) -> bool {
-    flow_packets == 1 || flow_packets.is_multiple_of(OWNER_QUERY_RETRY_PACKET_INTERVAL)
+fn should_queue_owner_query(profile: RuntimeProfile, flow_packets: u64) -> bool {
+    let retry_interval = match profile {
+        RuntimeProfile::Capture => OWNER_QUERY_RETRY_PACKET_INTERVAL,
+        RuntimeProfile::Forward => FORWARD_OWNER_QUERY_RETRY_PACKET_INTERVAL,
+    };
+
+    flow_packets == 1 || flow_packets.is_multiple_of(retry_interval)
+}
+
+fn drain_forward_queue(receiver: &Receiver<Vec<u8>>, runtime: &mut CaptureRuntime) {
+    for _ in 0..FORWARD_DRAIN_BATCH_LIMIT {
+        match receiver.try_recv() {
+            Ok(bytes) => runtime.ingest_bytes(&bytes),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
 }

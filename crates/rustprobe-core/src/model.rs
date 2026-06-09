@@ -1,5 +1,39 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub type SharedStr = Arc<str>;
+
+static SHARED_STR_POOL: OnceLock<RwLock<HashSet<SharedStr>>> = OnceLock::new();
+const SHARED_STR_POOL_PRUNE_INTERVAL: usize = 1024;
+
+pub fn shared_str(value: impl AsRef<str>) -> SharedStr {
+    let value = value.as_ref();
+    let pool = SHARED_STR_POOL.get_or_init(|| RwLock::new(HashSet::new()));
+
+    if let Some(existing) = pool
+        .read()
+        .expect("shared string pool poisoned")
+        .get(value)
+        .cloned()
+    {
+        return existing;
+    }
+
+    let mut pool = pool.write().expect("shared string pool poisoned");
+    if let Some(existing) = pool.get(value).cloned() {
+        return existing;
+    }
+
+    if pool.len() % SHARED_STR_POOL_PRUNE_INTERVAL == 0 {
+        pool.retain(|entry| Arc::strong_count(entry) > 1);
+    }
+
+    let shared = Arc::<str>::from(value);
+    pool.insert(shared.clone());
+    shared
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ProtocolHint {
@@ -72,19 +106,19 @@ pub struct ParsedPacket {
     pub ip_version: IpVersion,
     pub protocol: ProtocolHint,
     pub transport_protocol: ProtocolHint,
-    pub src_addr: String,
-    pub dst_addr: String,
+    pub src_addr: SharedStr,
+    pub dst_addr: SharedStr,
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
     pub tcp_sequence: Option<u32>,
     pub payload_len: usize,
-    pub dns_query_name: Option<String>,
-    pub tls_server_name: Option<String>,
-    pub quic_server_name: Option<String>,
-    pub http_host: Option<String>,
-    pub http_request_target: Option<String>,
-    pub application_protocols: Vec<String>,
-    pub quic_destination_connection_id: Option<String>,
+    pub dns_query_name: Option<SharedStr>,
+    pub tls_server_name: Option<SharedStr>,
+    pub quic_server_name: Option<SharedStr>,
+    pub http_host: Option<SharedStr>,
+    pub http_request_target: Option<SharedStr>,
+    pub application_protocols: Vec<SharedStr>,
+    pub quic_destination_connection_id: Option<SharedStr>,
     pub dns_candidate: bool,
     pub tls_candidate: bool,
     pub quic_candidate: bool,
@@ -97,8 +131,8 @@ pub struct ParsedPacket {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    pub src_addr: String,
-    pub dst_addr: String,
+    pub src_addr: SharedStr,
+    pub dst_addr: SharedStr,
     pub src_port: u16,
     pub dst_port: u16,
     pub protocol: ProtocolHint,
@@ -120,7 +154,7 @@ pub struct FlowState {
     pub key: FlowKey,
     pub protocol_hint: ProtocolHint,
     pub app: Option<AppIdentity>,
-    pub domain: Option<String>,
+    pub domain: Option<SharedStr>,
     pub domain_source: Option<DomainSource>,
     pub dns_candidate: bool,
     pub tls_candidate: bool,
@@ -129,10 +163,10 @@ pub struct FlowState {
     pub doh_candidate: bool,
     pub dot_candidate: bool,
     pub http3_candidate: bool,
-    pub tls_server_name: Option<String>,
-    pub quic_server_name: Option<String>,
-    pub http_host: Option<String>,
-    pub application_protocols: Vec<String>,
+    pub tls_server_name: Option<SharedStr>,
+    pub quic_server_name: Option<SharedStr>,
+    pub http_host: Option<SharedStr>,
+    pub application_protocols: Vec<SharedStr>,
     pub packets: u64,
     pub payload_bytes: u64,
     pub first_seen_unix_ms: u128,
@@ -181,7 +215,7 @@ impl FlowState {
         self.protocol_hint = protocol_hint;
     }
 
-    pub fn set_domain(&mut self, domain: Option<String>) {
+    pub fn set_domain(&mut self, domain: Option<SharedStr>) {
         self.domain = domain;
     }
 
@@ -217,19 +251,19 @@ impl FlowState {
         self.http3_candidate = http3_candidate;
     }
 
-    pub fn set_tls_server_name(&mut self, server_name: Option<String>) {
+    pub fn set_tls_server_name(&mut self, server_name: Option<SharedStr>) {
         self.tls_server_name = server_name;
     }
 
-    pub fn set_quic_server_name(&mut self, server_name: Option<String>) {
+    pub fn set_quic_server_name(&mut self, server_name: Option<SharedStr>) {
         self.quic_server_name = server_name;
     }
 
-    pub fn set_http_host(&mut self, host: Option<String>) {
+    pub fn set_http_host(&mut self, host: Option<SharedStr>) {
         self.http_host = host;
     }
 
-    pub fn set_application_protocols(&mut self, protocols: Vec<String>) {
+    pub fn set_application_protocols(&mut self, protocols: Vec<SharedStr>) {
         self.application_protocols = protocols;
     }
 }
@@ -252,7 +286,7 @@ pub struct ObjectRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ObjectKey {
     pub kind: ObjectKind,
-    pub value: String,
+    pub value: SharedStr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,4 +379,18 @@ pub struct AlertRecord {
     pub summary: String,
     pub risk: RiskLevel,
     pub app: Option<AppIdentity>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shared_str;
+    use std::sync::Arc;
+
+    #[test]
+    fn shared_str_reuses_allocations_for_equal_content() {
+        let first = shared_str("example.com");
+        let second = shared_str("example.com");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 }

@@ -12,7 +12,7 @@ use pnet::packet::tcp::TcpPacket;
 use pnet::packet::udp::UdpPacket;
 use rustprobe_core::{
     FlowEvent, FlowRecord, IpVersion, NetworkEndpoint, ObjectKind, ObjectRecord, PacketEvent,
-    ParsedPacket, ProtocolHint, RiskLevel,
+    ParsedPacket, ProtocolHint, RiskLevel, shared_str,
 };
 use sha2::Sha256;
 
@@ -135,19 +135,25 @@ impl ParserStage {
             ip_version: IpVersion::V4,
             protocol: transport.protocol,
             transport_protocol: transport.transport_protocol,
-            src_addr: packet.get_source().to_string(),
-            dst_addr: packet.get_destination().to_string(),
+            src_addr: shared_str(packet.get_source().to_string()),
+            dst_addr: shared_str(packet.get_destination().to_string()),
             src_port: transport.src_port,
             dst_port: transport.dst_port,
             tcp_sequence: transport.tcp_sequence,
             payload_len: transport.payload_len,
-            dns_query_name: transport.dns_query_name,
-            tls_server_name: transport.tls_server_name,
-            quic_server_name: transport.quic_server_name,
-            http_host: transport.http_host,
-            http_request_target: transport.http_request_target,
-            application_protocols: transport.application_protocols,
-            quic_destination_connection_id: transport.quic_destination_connection_id,
+            dns_query_name: transport.dns_query_name.map(shared_str),
+            tls_server_name: transport.tls_server_name.map(shared_str),
+            quic_server_name: transport.quic_server_name.map(shared_str),
+            http_host: transport.http_host.map(shared_str),
+            http_request_target: transport.http_request_target.map(shared_str),
+            application_protocols: transport
+                .application_protocols
+                .into_iter()
+                .map(shared_str)
+                .collect(),
+            quic_destination_connection_id: transport
+                .quic_destination_connection_id
+                .map(shared_str),
             dns_candidate: transport.dns_candidate,
             tls_candidate: transport.tls_candidate,
             quic_candidate: transport.quic_candidate,
@@ -168,19 +174,25 @@ impl ParserStage {
             ip_version: IpVersion::V6,
             protocol: transport.protocol,
             transport_protocol: transport.transport_protocol,
-            src_addr: packet.get_source().to_string(),
-            dst_addr: packet.get_destination().to_string(),
+            src_addr: shared_str(packet.get_source().to_string()),
+            dst_addr: shared_str(packet.get_destination().to_string()),
             src_port: transport.src_port,
             dst_port: transport.dst_port,
             tcp_sequence: transport.tcp_sequence,
             payload_len: transport.payload_len,
-            dns_query_name: transport.dns_query_name,
-            tls_server_name: transport.tls_server_name,
-            quic_server_name: transport.quic_server_name,
-            http_host: transport.http_host,
-            http_request_target: transport.http_request_target,
-            application_protocols: transport.application_protocols,
-            quic_destination_connection_id: transport.quic_destination_connection_id,
+            dns_query_name: transport.dns_query_name.map(shared_str),
+            tls_server_name: transport.tls_server_name.map(shared_str),
+            quic_server_name: transport.quic_server_name.map(shared_str),
+            http_host: transport.http_host.map(shared_str),
+            http_request_target: transport.http_request_target.map(shared_str),
+            application_protocols: transport
+                .application_protocols
+                .into_iter()
+                .map(shared_str)
+                .collect(),
+            quic_destination_connection_id: transport
+                .quic_destination_connection_id
+                .map(shared_str),
             dns_candidate: transport.dns_candidate,
             tls_candidate: transport.tls_candidate,
             quic_candidate: transport.quic_candidate,

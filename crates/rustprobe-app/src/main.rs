@@ -1,7 +1,7 @@
 use rustprobe_attrib::AttributionActor;
 use rustprobe_capture::TunCaptureActor;
 use rustprobe_core::{
-    AppIdentity, AppSelectionMode, IpVersion, ParsedPacket, TrafficDispositionMode,
+    AppIdentity, AppSelectionMode, IpVersion, ParsedPacket, TrafficDispositionMode, shared_str,
 };
 use rustprobe_detect::DetectionActor;
 use rustprobe_flow::FlowActor;
@@ -37,8 +37,8 @@ async fn main() -> anyhow::Result<()> {
         ip_version: IpVersion::V4,
         protocol: flow.flow.protocol.clone(),
         transport_protocol: flow.flow.protocol.clone(),
-        src_addr: flow.flow.src.host.clone(),
-        dst_addr: flow.flow.dst.host.clone(),
+        src_addr: shared_str(&flow.flow.src.host),
+        dst_addr: shared_str(&flow.flow.dst.host),
         src_port: Some(flow.flow.src.port),
         dst_port: Some(flow.flow.dst.port),
         tcp_sequence: None,

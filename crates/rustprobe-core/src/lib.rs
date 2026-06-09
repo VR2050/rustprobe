@@ -10,5 +10,5 @@ pub use model::{
     AlertRecord, AppIdentity, AppMetricsSnapshot, AppTrafficAnalyticsSnapshot, AppTrafficView,
     DomainSource, FlowKey, FlowOwnerQuery, FlowOwnerResolution, FlowRecord, FlowState, IpVersion,
     NetworkEndpoint, ObjectKey, ObjectKind, ObjectRecord, ObjectState, ParsedPacket, ProtocolHint,
-    RankedMetric, RiskLevel, TrafficSeriesPoint, now_unix_ms,
+    RankedMetric, RiskLevel, SharedStr, TrafficSeriesPoint, now_unix_ms, shared_str,
 };

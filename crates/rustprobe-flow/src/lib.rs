@@ -1,13 +1,13 @@
 use rustprobe_core::{
     AppIdentity, DomainSource, FlowKey, FlowState, ObjectKey, ObjectKind, ObjectState,
-    ParsedPacket, now_unix_ms,
+    ParsedPacket, SharedStr, now_unix_ms, shared_str,
 };
 use rustprobe_parse::{
     QuicCryptoFragment, extract_quic_initial_crypto_fragments, parse_dns_query_name_over_tcp,
     parse_http_request_metadata, parse_tls_client_hello_server_name,
     parse_tls_client_hello_server_name_from_handshake,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 const DEFAULT_FLOW_IDLE_TIMEOUT_MS: u128 = 60_000;
 const TCP_BUFFER_LIMIT_BYTES: usize = 16 * 1024;
@@ -20,15 +20,15 @@ struct TcpReassemblyBuffer {
 
 #[derive(Debug, Default)]
 struct QuicCryptoReassemblyBuffer {
-    destination_connection_id: Option<String>,
+    destination_connection_id: Option<SharedStr>,
     fragments: BTreeMap<usize, Vec<u8>>,
 }
 
 #[derive(Debug, Default)]
 struct TcpDerivedMetadata {
-    dns_query_name: Option<String>,
-    tls_server_name: Option<String>,
-    http_host: Option<String>,
+    dns_query_name: Option<SharedStr>,
+    tls_server_name: Option<SharedStr>,
+    http_host: Option<SharedStr>,
     doh_candidate: bool,
 }
 
@@ -75,89 +75,44 @@ impl FlowActor {
 
         self.flows_seen += 1;
 
-        let mut flow = self
-            .table
-            .entry(key.clone())
-            .and_modify(|entry| {
-                entry.update(packet.payload_len);
-                merge_packet_metadata(entry, packet);
-            })
-            .or_insert_with(|| {
-                let mut flow = FlowState::new(key, packet.payload_len);
-                merge_packet_metadata(&mut flow, packet);
-                flow
-            })
-            .clone();
+        {
+            let flow = self
+                .table
+                .entry(key.clone())
+                .and_modify(|entry| {
+                    entry.update(packet.payload_len);
+                    merge_packet_metadata(entry, packet);
+                })
+                .or_insert_with(|| {
+                    let mut flow = FlowState::new(key.clone(), packet.payload_len);
+                    merge_packet_metadata(&mut flow, packet);
+                    flow
+                });
+            let _ = flow;
+        }
 
-        let derived_tcp_metadata = self.maybe_extract_tcp_metadata(&flow.key, packet);
-        let derived_quic_server_name = if flow.quic_server_name.is_none() {
-            self.maybe_extract_quic_server_name(&flow.key, packet)
+        let flow_missing_quic_name = self
+            .table
+            .get(&key)
+            .map(|flow| flow.quic_server_name.is_none())
+            .unwrap_or(false);
+        let derived_tcp_metadata = self.maybe_extract_tcp_metadata(&key, packet);
+        let derived_quic_server_name = if flow_missing_quic_name {
+            self.maybe_extract_quic_server_name(&key, packet)
         } else {
             None
         };
 
-        if let Some(server_name) = derived_tcp_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.tls_server_name.as_ref())
-        {
-            flow.set_protocol_hint(rustprobe_core::ProtocolHint::Tls);
-            flow.set_tls_server_name(Some(server_name.clone()));
-            prefer_domain(&mut flow, server_name.clone(), DomainSource::TlsSni);
-            let _ = self.table.get_mut(&flow.key).map(|entry| {
-                entry.set_protocol_hint(rustprobe_core::ProtocolHint::Tls);
-                entry.set_tls_server_name(Some(server_name.clone()));
-                prefer_domain(entry, server_name.clone(), DomainSource::TlsSni);
-            });
-        }
-
-        if let Some(domain) = derived_tcp_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.dns_query_name.as_ref())
-        {
-            flow.set_protocol_hint(rustprobe_core::ProtocolHint::Dns);
-            prefer_domain(&mut flow, domain.clone(), DomainSource::Dns);
-            let _ = self.table.get_mut(&flow.key).map(|entry| {
-                entry.set_protocol_hint(rustprobe_core::ProtocolHint::Dns);
-                prefer_domain(entry, domain.clone(), DomainSource::Dns);
-            });
-        }
-
-        if let Some(host) = derived_tcp_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.http_host.as_ref())
-        {
-            flow.set_protocol_hint(rustprobe_core::ProtocolHint::Http);
-            flow.set_http_host(Some(host.clone()));
-            prefer_domain(&mut flow, host.clone(), DomainSource::HttpHost);
-            let _ = self.table.get_mut(&flow.key).map(|entry| {
-                entry.set_protocol_hint(rustprobe_core::ProtocolHint::Http);
-                entry.set_http_host(Some(host.clone()));
-                prefer_domain(entry, host.clone(), DomainSource::HttpHost);
-            });
-        }
-
-        if derived_tcp_metadata
-            .as_ref()
-            .map(|metadata| metadata.doh_candidate)
-            .unwrap_or(false)
-        {
-            flow.set_doh_candidate(true);
-            let _ = self
-                .table
-                .get_mut(&flow.key)
-                .map(|entry| entry.set_doh_candidate(true));
-        }
-
-        if let Some(server_name) = derived_quic_server_name.as_ref() {
-            flow.set_protocol_hint(rustprobe_core::ProtocolHint::Quic);
-            flow.set_quic_server_name(Some(server_name.clone()));
-            prefer_domain(&mut flow, server_name.clone(), DomainSource::QuicInitialSni);
-            let _ = self.table.get_mut(&flow.key).map(|entry| {
-                entry.set_protocol_hint(rustprobe_core::ProtocolHint::Quic);
-                entry.set_quic_server_name(Some(server_name.clone()));
-                prefer_domain(entry, server_name.clone(), DomainSource::QuicInitialSni);
-            });
-        }
+        let flow = self
+            .table
+            .get_mut(&key)
+            .expect("flow entry must exist after insertion");
+        apply_derived_metadata(
+            flow,
+            derived_tcp_metadata.as_ref(),
+            derived_quic_server_name.as_deref(),
+        );
+        let flow = flow.clone();
 
         let touched_objects = self.update_objects(
             packet,
@@ -199,6 +154,10 @@ impl FlowActor {
         self.objects.values().cloned().collect()
     }
 
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
     pub fn set_flow_app(&mut self, key: &FlowKey, app: Option<AppIdentity>) -> bool {
         match self.table.get_mut(key) {
             Some(flow) => {
@@ -210,15 +169,27 @@ impl FlowActor {
     }
 
     pub fn expire_idle_flows(&mut self) -> usize {
+        self.take_expired_flows().len()
+    }
+
+    pub fn take_expired_flows(&mut self) -> Vec<FlowState> {
         let now = now_unix_ms();
-        let before = self.table.len();
-        self.table
-            .retain(|_, flow| now.saturating_sub(flow.last_seen_unix_ms) <= self.idle_timeout_ms);
-        self.tcp_buffers
-            .retain(|key, _| self.table.contains_key(key));
-        self.quic_buffers
-            .retain(|key, _| self.table.contains_key(key));
-        before.saturating_sub(self.table.len())
+        let expired_keys = self
+            .table
+            .iter()
+            .filter(|(_, flow)| now.saturating_sub(flow.last_seen_unix_ms) > self.idle_timeout_ms)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut expired = Vec::with_capacity(expired_keys.len());
+
+        for key in expired_keys {
+            if let Some(flow) = self.table.remove(&key) {
+                expired.push(flow);
+            }
+            self.tcp_buffers.remove(&key);
+            self.quic_buffers.remove(&key);
+        }
+        expired
     }
 
     fn update_objects(
@@ -231,7 +202,6 @@ impl FlowActor {
     ) -> Vec<ObjectState> {
         let active_flows = self.active_flows();
         let mut touched = Vec::new();
-        let mut seen_keys = HashSet::new();
         let ip_key = ObjectKey {
             kind: ObjectKind::Ip,
             value: packet.dst_addr.clone(),
@@ -241,7 +211,7 @@ impl FlowActor {
         if let Some(dst_port) = packet.dst_port {
             let port_key = ObjectKey {
                 kind: ObjectKind::Port,
-                value: dst_port.to_string(),
+                value: shared_str(dst_port.to_string()),
             };
             touched.push(self.upsert_object(port_key, packet.payload_len, active_flows));
         }
@@ -249,72 +219,56 @@ impl FlowActor {
         if let Some(domain) = packet.dns_query_name.as_ref() {
             Self::push_unique_object(
                 &mut touched,
-                &mut seen_keys,
-                self.update_domain_object(domain.clone(), packet.payload_len, active_flows),
+                self.update_domain_object(domain, packet.payload_len, active_flows),
             );
         }
 
         if let Some(server_name) = packet.tls_server_name.as_ref() {
             Self::push_unique_object(
                 &mut touched,
-                &mut seen_keys,
-                self.update_domain_object(server_name.clone(), packet.payload_len, active_flows),
+                self.update_domain_object(server_name, packet.payload_len, active_flows),
             );
         }
 
         if let Some(server_name) = packet.quic_server_name.as_ref() {
             Self::push_unique_object(
                 &mut touched,
-                &mut seen_keys,
-                self.update_domain_object(server_name.clone(), packet.payload_len, active_flows),
+                self.update_domain_object(server_name, packet.payload_len, active_flows),
             );
         }
 
         if let Some(host) = packet.http_host.as_ref() {
             Self::push_unique_object(
                 &mut touched,
-                &mut seen_keys,
-                self.update_domain_object(host.clone(), packet.payload_len, active_flows),
+                self.update_domain_object(host, packet.payload_len, active_flows),
             );
         }
 
         if let Some(server_name) = derived_tls_server_name {
             Self::push_unique_object(
                 &mut touched,
-                &mut seen_keys,
-                self.update_domain_object(
-                    server_name.to_string(),
-                    packet.payload_len,
-                    active_flows,
-                ),
+                self.update_domain_object(server_name, packet.payload_len, active_flows),
             );
         }
 
         if let Some(domain) = derived_dns_query_name {
             Self::push_unique_object(
                 &mut touched,
-                &mut seen_keys,
-                self.update_domain_object(domain.to_string(), packet.payload_len, active_flows),
+                self.update_domain_object(domain, packet.payload_len, active_flows),
             );
         }
 
         if let Some(host) = derived_http_host {
             Self::push_unique_object(
                 &mut touched,
-                &mut seen_keys,
-                self.update_domain_object(host.to_string(), packet.payload_len, active_flows),
+                self.update_domain_object(host, packet.payload_len, active_flows),
             );
         }
 
         if let Some(server_name) = derived_quic_server_name {
             Self::push_unique_object(
                 &mut touched,
-                &mut seen_keys,
-                self.update_domain_object(
-                    server_name.to_string(),
-                    packet.payload_len,
-                    active_flows,
-                ),
+                self.update_domain_object(server_name, packet.payload_len, active_flows),
             );
         }
 
@@ -323,7 +277,7 @@ impl FlowActor {
 
     fn update_domain_object(
         &mut self,
-        domain: String,
+        domain: &str,
         bytes: usize,
         active_flows: usize,
     ) -> ObjectState {
@@ -343,12 +297,8 @@ impl FlowActor {
         entry.clone()
     }
 
-    fn push_unique_object(
-        objects: &mut Vec<ObjectState>,
-        seen_keys: &mut HashSet<ObjectKey>,
-        object: ObjectState,
-    ) {
-        if seen_keys.insert(object.key.clone()) {
+    fn push_unique_object(objects: &mut Vec<ObjectState>, object: ObjectState) {
+        if !objects.iter().any(|existing| existing.key == object.key) {
             objects.push(object);
         }
     }
@@ -375,11 +325,15 @@ impl FlowActor {
         let buffer = self.tcp_buffers.entry(key.clone()).or_default();
         append_tcp_payload(buffer, packet);
         let prefix = tcp_contiguous_prefix(buffer, TCP_BUFFER_LIMIT_BYTES)?;
+        let http_metadata = parse_http_request_metadata(&prefix);
         let metadata = TcpDerivedMetadata {
-            dns_query_name: parse_dns_query_name_over_tcp(&prefix),
-            tls_server_name: parse_tls_client_hello_server_name(&prefix),
-            http_host: parse_http_request_metadata(&prefix).map(|metadata| metadata.host),
-            doh_candidate: parse_http_request_metadata(&prefix)
+            dns_query_name: parse_dns_query_name_over_tcp(&prefix).map(shared_str),
+            tls_server_name: parse_tls_client_hello_server_name(&prefix).map(shared_str),
+            http_host: http_metadata
+                .as_ref()
+                .map(|metadata| shared_str(&metadata.host)),
+            doh_candidate: http_metadata
+                .as_ref()
                 .map(|metadata| metadata.is_doh)
                 .unwrap_or(false),
         };
@@ -397,7 +351,7 @@ impl FlowActor {
         &mut self,
         key: &FlowKey,
         packet: &ParsedPacket,
-    ) -> Option<String> {
+    ) -> Option<SharedStr> {
         if !matches!(packet.protocol, rustprobe_core::ProtocolHint::Quic) {
             return None;
         }
@@ -414,7 +368,8 @@ impl FlowActor {
             &fragments,
         );
         let handshake_prefix = quic_crypto_contiguous_prefix(buffer)?;
-        let server_name = parse_tls_client_hello_server_name_from_handshake(&handshake_prefix);
+        let server_name =
+            parse_tls_client_hello_server_name_from_handshake(&handshake_prefix).map(shared_str);
         if server_name.is_some() {
             self.quic_buffers.remove(key);
         }
@@ -441,10 +396,7 @@ impl Default for FlowActor {
 }
 
 fn merge_packet_metadata(flow: &mut FlowState, packet: &ParsedPacket) {
-    flow.set_protocol_hint(prefer_protocol_hint(
-        flow.protocol_hint.clone(),
-        packet.protocol.clone(),
-    ));
+    flow.set_protocol_hint(prefer_protocol_hint(&flow.protocol_hint, &packet.protocol));
     flow.set_dns_candidate(flow.dns_candidate || packet.dns_candidate);
     flow.set_tls_candidate(flow.tls_candidate || packet.tls_candidate);
     flow.set_quic_candidate(flow.quic_candidate || packet.quic_candidate);
@@ -478,7 +430,7 @@ fn merge_packet_metadata(flow: &mut FlowState, packet: &ParsedPacket) {
     }
 }
 
-fn prefer_domain(flow: &mut FlowState, domain: String, source: DomainSource) {
+fn prefer_domain(flow: &mut FlowState, domain: SharedStr, source: DomainSource) {
     let normalized = normalize_domain(domain);
     let current_rank = flow
         .domain_source
@@ -488,8 +440,7 @@ fn prefer_domain(flow: &mut FlowState, domain: String, source: DomainSource) {
     let incoming_rank = domain_source_rank(&source);
     let should_replace = flow.domain.is_none()
         || incoming_rank > current_rank
-        || (incoming_rank == current_rank
-            && flow.domain.as_deref() != Some(normalized.as_str()));
+        || (incoming_rank == current_rank && flow.domain.as_deref() != Some(normalized.as_ref()));
 
     if should_replace {
         flow.set_domain(Some(normalized));
@@ -497,8 +448,14 @@ fn prefer_domain(flow: &mut FlowState, domain: String, source: DomainSource) {
     }
 }
 
-fn normalize_domain(domain: String) -> String {
-    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+fn normalize_domain(domain: impl AsRef<str>) -> SharedStr {
+    shared_str(
+        domain
+            .as_ref()
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+    )
 }
 
 fn domain_source_rank(source: &DomainSource) -> u8 {
@@ -511,23 +468,66 @@ fn domain_source_rank(source: &DomainSource) -> u8 {
 }
 
 fn prefer_protocol_hint(
-    current: rustprobe_core::ProtocolHint,
-    incoming: rustprobe_core::ProtocolHint,
+    current: &rustprobe_core::ProtocolHint,
+    incoming: &rustprobe_core::ProtocolHint,
 ) -> rustprobe_core::ProtocolHint {
-    if protocol_rank(incoming.clone()) >= protocol_rank(current.clone()) {
-        incoming
+    if protocol_rank(incoming) >= protocol_rank(current) {
+        incoming.clone()
     } else {
-        current
+        current.clone()
     }
 }
 
-fn protocol_rank(protocol: rustprobe_core::ProtocolHint) -> u8 {
+fn protocol_rank(protocol: &rustprobe_core::ProtocolHint) -> u8 {
     use rustprobe_core::ProtocolHint;
 
     match protocol {
         ProtocolHint::Unknown => 0,
         ProtocolHint::Tcp | ProtocolHint::Udp | ProtocolHint::Icmp => 1,
         ProtocolHint::Quic | ProtocolHint::Http | ProtocolHint::Dns | ProtocolHint::Tls => 2,
+    }
+}
+
+fn apply_derived_metadata(
+    flow: &mut FlowState,
+    derived_tcp_metadata: Option<&TcpDerivedMetadata>,
+    derived_quic_server_name: Option<&str>,
+) {
+    if let Some(server_name) =
+        derived_tcp_metadata.and_then(|metadata| metadata.tls_server_name.as_deref())
+    {
+        flow.set_protocol_hint(rustprobe_core::ProtocolHint::Tls);
+        let server_name = shared_str(server_name);
+        flow.set_tls_server_name(Some(server_name.clone()));
+        prefer_domain(flow, server_name, DomainSource::TlsSni);
+    }
+
+    if let Some(domain) =
+        derived_tcp_metadata.and_then(|metadata| metadata.dns_query_name.as_deref())
+    {
+        flow.set_protocol_hint(rustprobe_core::ProtocolHint::Dns);
+        prefer_domain(flow, shared_str(domain), DomainSource::Dns);
+    }
+
+    if let Some(host) = derived_tcp_metadata.and_then(|metadata| metadata.http_host.as_deref()) {
+        flow.set_protocol_hint(rustprobe_core::ProtocolHint::Http);
+        let host = shared_str(host);
+        flow.set_http_host(Some(host.clone()));
+        prefer_domain(flow, host, DomainSource::HttpHost);
+    }
+
+    if derived_tcp_metadata
+        .map(|metadata| metadata.doh_candidate)
+        .unwrap_or(false)
+    {
+        flow.set_doh_candidate(true);
+    }
+
+    if let Some(server_name) = derived_quic_server_name {
+        flow.set_protocol_hint(rustprobe_core::ProtocolHint::Quic);
+        let server_name = shared_str(server_name);
+        flow.set_quic_server_name(Some(server_name.clone()));
+        prefer_domain(flow, server_name, DomainSource::QuicInitialSni);
     }
 }
 
@@ -591,7 +591,7 @@ fn append_quic_crypto_fragments(
     fragments: &[QuicCryptoFragment],
 ) {
     if destination_connection_id != buffer.destination_connection_id.as_deref() {
-        buffer.destination_connection_id = destination_connection_id.map(ToOwned::to_owned);
+        buffer.destination_connection_id = destination_connection_id.map(shared_str);
         buffer.fragments.clear();
     }
     for fragment in fragments {
@@ -695,6 +695,10 @@ mod tests {
 
         assert_eq!(result.flow.domain.as_deref(), Some("www.example.com"));
         let objects = actor.object_snapshot();
-        assert!(objects.iter().any(|object| object.key.value == "www.example.com"));
+        assert!(
+            objects
+                .iter()
+                .any(|object| object.key.value.as_ref() == "www.example.com")
+        );
     }
 }

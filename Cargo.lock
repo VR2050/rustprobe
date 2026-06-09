@@ -560,6 +560,8 @@ dependencies = [
  "rustprobe-metrics",
  "rustprobe-parse",
  "rustprobe-store",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

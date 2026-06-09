@@ -8,6 +8,8 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 rustprobe-attrib = { path = "../rustprobe-attrib" }
 rustprobe-core = { path = "../rustprobe-core" }
 rustprobe-flow = { path = "../rustprobe-flow" }

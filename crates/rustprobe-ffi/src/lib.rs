@@ -7,7 +7,7 @@ use rustprobe_attrib::{
     upsert_app_runtime,
 };
 use rustprobe_capture::{
-    ingest_mirrored_packet, is_capture_running, packets_seen, set_output_root,
+    capture_stats, ingest_mirrored_packet, is_capture_running, packets_seen, set_output_root,
     start_capture_from_fd, start_mirrored_capture, stop_capture,
 };
 use rustprobe_core::{AppIdentity, AppSelectionMode, FlowKey, FlowOwnerResolution};
@@ -73,6 +73,18 @@ pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativePacketsSeen(
     _class: JClass<'_>,
 ) -> jint {
     packets_seen() as jint
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_rustprobe_app_RustBridge_nativeCaptureStats(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let stats = capture_stats();
+    let json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".into());
+    env.new_string(json)
+        .expect("failed to allocate capture stats string")
+        .into_raw()
 }
 
 #[unsafe(no_mangle)]

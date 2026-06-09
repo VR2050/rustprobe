@@ -182,8 +182,11 @@ class RustProbeVpnService : VpnService() {
             val builder = Builder()
                 .setSession(if (forwarding) "RustProbe Forwarding" else "RustProbe")
                 .addAddress("10.10.0.2", 24)
+                .addAddress("fd00:1:fd00:1::2", 120)
                 .addRoute("0.0.0.0", 0)
+                .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
+                .addDnsServer("2606:4700:4700::1111")
 
             if (forwarding) {
                 builder.setBlocking(false)
@@ -455,10 +458,8 @@ class RustProbeVpnService : VpnService() {
     }
 
     private fun logRuntimeStatus(reason: String) {
-        val captureRunning = runCatching { RustBridge.nativeIsCaptureRunning() }
-            .getOrDefault(false)
-        val packetsSeen = runCatching { RustBridge.nativePacketsSeen() }
-            .getOrDefault(-1)
+        val captureStats = runCatching { RustBridge.captureStats() }
+            .getOrNull()
         val stats = runCatching { RustBridge.attributionStats() }
             .getOrNull()
 
@@ -466,10 +467,23 @@ class RustProbeVpnService : VpnService() {
             TAG,
             buildString {
                 append(reason)
-                append(": captureRunning=")
-                append(captureRunning)
-                append(" packetsSeen=")
-                append(packetsSeen)
+                append(": ipv4DefaultRoute=true ipv6DefaultRoute=true")
+                if (captureStats != null) {
+                    append(" captureRunning=")
+                    append(captureStats.captureRunning)
+                    append(" packetsSeen=")
+                    append(captureStats.packetsSeen)
+                    append(" mirroredPacketsReceived=")
+                    append(captureStats.mirroredPacketsReceived)
+                    append(" mirroredPacketsAccepted=")
+                    append(captureStats.mirroredPacketsAccepted)
+                    append(" mirroredPacketsDropped=")
+                    append(captureStats.mirroredPacketsDropped)
+                    append(" mirroredDropRatio=")
+                    append(String.format("%.4f", captureStats.mirroredDropRatio))
+                    append(" mirroredQueueCapacity=")
+                    append(captureStats.mirroredIngestQueueCapacity)
+                }
                 append(" ownerQueryCount=")
                 append(ownerQueryCount)
                 append(" ownerResolutionHitCount=")
